@@ -67,6 +67,8 @@ let response = try await client.connect(
 ```
 Upon a successful connect call, `MacrofyClient` automatically stores the 30-day Bearer JWT in the iOS Keychain and injects `Authorization: Bearer <token>` into all subsequent authenticated requests.
 
+> **Security note**: `devAppSecret` in `ContentView.swift` is wrapped in `#if DEBUG`, so it is always `nil` — and therefore never compiled into the binary — for Release/TestFlight/App Store builds. `SignatureUtility.generateHMAC` decodes a hex-encoded `appSecret` into raw key bytes before signing, matching the key material the API expects. Because `HMAC_SHA256(appSecret, userId)` is deterministic, treat any generated signature as sensitive and short-lived: generate it immediately before calling `connect`, never log it, and prefer proxying this exchange through your backend (Step 5 below) so the secret and signature never reach the client at all.
+
 ### 3. Food Diary & Daily Progress
 `MacrofyAppViewModel.loadDailyData()` fetches diary entries and daily aggregate totals in parallel:
 ```swift
@@ -95,7 +97,7 @@ The application demonstrates the full meal analysis lifecycle via `analyzeAndLog
 ### Quick Run Steps
 1. Open `Nutrition AI QuickStart.xcodeproj` in Xcode.
 2. Open `Configuration.swift` and replace `"YOUR_APP_ID"` with your registered Application ID from the Macrofy Developer Portal.
-3. Open `ContentView.swift` and locate `devAppSecret` inside `MacrofyAppViewModel`. Replace `"YOUR_APP_SECRET"` with your 64-character development secret.
+3. Open `ContentView.swift` and locate `devAppSecret` inside `MacrofyAppViewModel`. Replace `"YOUR_APP_SECRET"` with your 64-character development secret. This value is wrapped in `#if DEBUG`, so it only exists in Debug builds — Release/TestFlight/App Store builds always get `nil` and must use the backend handshake described in Step 5 of Section 5 below.
 4. Select an iOS Simulator (e.g., iPhone 16 Pro) and press **Cmd + R** to run.
 5. In the simulator:
    - Tap **Connect User** to execute the cryptographic handshake.
@@ -172,11 +174,19 @@ struct FoodSearchView: View {
         }
         .searchable(text: $searchQuery)
         .task(id: searchQuery) {
-            guard searchQuery.count >= 2 else { return }
-            try? await Task.sleep(nanoseconds: 300_000_000) // 300ms debounce
-            if let results = try? await client.searchFoods(query: searchQuery, limit: 20) {
-                self.searchResults = results
+            guard searchQuery.count >= 2 else {
+                searchResults = []
+                return
             }
+            do {
+                try await Task.sleep(nanoseconds: 300_000_000) // 300ms debounce
+            } catch {
+                return // Superseded by a newer keystroke; let the new task take over.
+            }
+            guard !Task.isCancelled,
+                  let results = try? await client.searchFoods(query: searchQuery, limit: 20),
+                  !Task.isCancelled else { return }
+            self.searchResults = results
         }
     }
 }
@@ -220,6 +230,7 @@ iOS Client                     Your Backend                  Macrofy API
     │ 5. Returns 30-Day Bearer JWT                                │
     │<────────────────────────────────────────────────────────────│
 ```
+Because `HMAC_SHA256(appSecret, userId)` is deterministic, a captured signature could be replayed to request another fresh JWT for that user. Keep this entire exchange server-side so the secret and signature never reach the client, and ask Macrofy support whether `POST /api/auth/connect` supports a challenge/nonce option if you need additional defense against replay from a compromised network path.
 
 ### Step 6: Token Auto-Refresh
 Before the 30-day JWT expires, call `client.refreshSession()` to maintain continuous authentication without requiring the user to reconnect:

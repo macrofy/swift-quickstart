@@ -28,16 +28,37 @@ public actor MacrofyClient {
 
     // MARK: - Session Management
 
-    public func setSession(token: String, user: SessionUser) {
+    /// Persists the session in memory and in the Keychain.
+    ///
+    /// The in-memory session (`currentToken`/`currentUser`) is always set so
+    /// the current app run can proceed immediately. If Keychain persistence
+    /// fails or only partially succeeds, any partial write is rolled back so
+    /// a future relaunch never reads a mismatched token/user pair (which
+    /// would otherwise appear "authenticated" with no user to load data
+    /// for). The return value reports whether persistence fully succeeded.
+    @discardableResult
+    public func setSession(token: String, user: SessionUser) -> Bool {
         self.currentToken = token
         self.currentUser = user
 
-        if let tokenData = token.data(using: .utf8) {
-            _ = keychain.save(key: tokenKey, data: tokenData)
+        guard let tokenData = token.data(using: .utf8),
+              let userData = try? JSONEncoder().encode(user) else {
+            keychain.delete(key: tokenKey)
+            keychain.delete(key: userKey)
+            return false
         }
-        if let userData = try? JSONEncoder().encode(user) {
-            _ = keychain.save(key: userKey, data: userData)
+
+        let tokenSaved = keychain.save(key: tokenKey, data: tokenData)
+        let userSaved = keychain.save(key: userKey, data: userData)
+
+        guard tokenSaved && userSaved else {
+            // Avoid leaving a half-written session that would desync the
+            // token and user on the next launch.
+            keychain.delete(key: tokenKey)
+            keychain.delete(key: userKey)
+            return false
         }
+        return true
     }
 
     public func clearSession() {
@@ -79,10 +100,14 @@ public actor MacrofyClient {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
 
+        // Track which token (if any) this specific request used, so a 401
+        // response can be correlated back to it below.
+        var requestToken: String?
         if requiresAuth {
             guard let token = currentToken else {
                 throw MacrofyError.unauthorized(message: "Missing session token. Call connect() first.")
             }
+            requestToken = token
             request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         }
 
@@ -114,7 +139,14 @@ public actor MacrofyClient {
             throw MacrofyError.badRequest(message: msg)
 
         case 401:
-            clearSession()
+            // Only clear the session if it still holds the exact token that
+            // was rejected. A concurrent request may have already installed
+            // a newer, valid session (e.g. via refreshSession()); clearing
+            // unconditionally would discard that replacement session and
+            // force an unnecessary reconnect.
+            if let requestToken, requestToken == currentToken {
+                clearSession()
+            }
             let msg = parseErrorMessage(data: data) ?? "Session expired or invalid"
             throw MacrofyError.unauthorized(message: msg)
 
@@ -230,13 +262,21 @@ public actor MacrofyClient {
     }
 
     /// Subscribes to real-time status updates via Server-Sent Events (SSE).
-    public func streamScanJobUpdates(jobId: String) -> AsyncThrowingStream<ImageScanStatusUpdate, Error> {
+    ///
+    /// A watchdog cancels the underlying connection if no terminal
+    /// (`completed`/`failed`) update arrives within `timeout` seconds, so
+    /// callers never wait indefinitely; the stream throws
+    /// `MacrofyError.sseTimeout` in that case. If the caller stops iterating
+    /// the stream early (for example, after it has already found a result),
+    /// `onTermination` cancels the producer task so the underlying network
+    /// connection doesn't keep running in the background.
+    public func streamScanJobUpdates(jobId: String, timeout: TimeInterval = 60) -> AsyncThrowingStream<ImageScanStatusUpdate, Error> {
         let streamURL = baseURL.appendingPathComponent("v1/scan/image/\(jobId)/stream")
         let token = self.currentToken
         let session = self.session
 
         return AsyncThrowingStream { continuation in
-            Task {
+            let producerTask = Task {
                 var request = URLRequest(url: streamURL)
                 request.httpMethod = "GET"
                 request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
@@ -253,6 +293,8 @@ public actor MacrofyClient {
                     }
 
                     for try await line in asyncBytes.lines {
+                        try Task.checkCancellation()
+
                         // Skip heartbeats and empty lines
                         if line.hasPrefix(":") || line.trimmingCharacters(in: .whitespaces).isEmpty {
                             continue
@@ -272,9 +314,24 @@ public actor MacrofyClient {
                         }
                     }
                     continuation.finish()
+                } catch is CancellationError {
+                    continuation.finish(throwing: MacrofyError.sseTimeout)
                 } catch {
                     continuation.finish(throwing: error)
                 }
+            }
+
+            let watchdogTask = Task {
+                try? await Task.sleep(nanoseconds: UInt64(max(timeout, 0) * 1_000_000_000))
+                producerTask.cancel()
+            }
+
+            // Fires when the stream finishes, is cancelled, or the consumer
+            // stops iterating and releases it — ensures the network request
+            // and watchdog never outlive interest in their results.
+            continuation.onTermination = { _ in
+                producerTask.cancel()
+                watchdogTask.cancel()
             }
         }
     }

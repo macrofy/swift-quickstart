@@ -20,9 +20,34 @@ final class MacrofyAppViewModel: ObservableObject {
     @Published var isScanning = false
     @Published var errorMessage: String?
 
-    private let developerUserId = "user_ios_001_demo"
-    // Development HMAC secret (Replace with backend handshake in production)
-    private let devAppSecret = "YOUR_APP_SECRET"
+    // MARK: - Demo Identity
+    //
+    // `developerUserId` is a stable, per-install identifier generated once
+    // and persisted in the Keychain, so each install of this QuickStart gets
+    // its own isolated Macrofy user, profile, and diary rather than every
+    // install sharing one hardcoded ID. In a real app, replace this with the
+    // ID of your already-signed-in user (from your own account system)
+    // instead of a device-generated ID.
+    private let developerUserId: String = MacrofyAppViewModel.loadOrCreateDemoUserId()
+
+    // MARK: - Development-Only Authentication
+    //
+    // `devAppSecret` only compiles into DEBUG builds, so the literal secret
+    // can never end up inside a Release/TestFlight/App Store binary. In
+    // Release builds this is always `nil`, which forces `authenticate()`
+    // onto the error path below rather than silently shipping a usable
+    // client-side secret. Production apps must never embed `appSecret`
+    // client-side at all: have your backend compute the HMAC signature and
+    // return it to the device (see README "Secure Production Handshake").
+    #if DEBUG
+    private let devAppSecret: String? = "YOUR_APP_SECRET"
+    #else
+    private let devAppSecret: String? = nil
+    #endif
+
+    /// Identifies the most recently started `loadDailyData()` call so a
+    /// slower, superseded refresh can't overwrite newer results.
+    private var latestDailyDataRequestID: UUID?
 
     init() {
         Task {
@@ -41,6 +66,13 @@ final class MacrofyAppViewModel: ObservableObject {
     }
 
     func authenticate() async {
+        self.errorMessage = nil
+
+        guard let devAppSecret else {
+            self.errorMessage = "Client-side signing is disabled in this build. Implement the backend handshake described in the README before shipping."
+            return
+        }
+
         do {
             let signature = SignatureUtility.generateHMAC(
                 appSecret: devAppSecret,
@@ -55,29 +87,48 @@ final class MacrofyAppViewModel: ObservableObject {
             self.currentUser = response.user
             await loadDailyData()
         } catch {
-            self.errorMessage = error.localizedDescription
+            handleError(error)
         }
     }
 
     func loadDailyData() async {
         guard let user = currentUser else { return }
-        let today = "2026-10-08"
+        let today = Self.diaryDateString()
+
+        let requestID = UUID()
+        latestDailyDataRequestID = requestID
 
         do {
-            async let entries = client.getDiaryEntries(userId: user.id, date: today)
-            async let totals = client.getDailyTotals(userId: user.id, date: today)
-            
-            self.diaryEntries = try await entries
-            self.dailyTotals = try await totals
+            async let entriesTask = client.getDiaryEntries(userId: user.id, date: today)
+            async let totalsTask = client.getDailyTotals(userId: user.id, date: today)
+
+            // Await both together so a failure in either one doesn't leave
+            // the UI showing a mix of new entries and stale totals (or vice
+            // versa) — we only assign once both have succeeded.
+            let (entries, totals) = try await (entriesTask, totalsTask)
+
+            // A newer refresh may have started and finished while this one
+            // was in flight; don't let this stale result overwrite it.
+            guard requestID == latestDailyDataRequestID else { return }
+
+            self.diaryEntries = entries
+            self.dailyTotals = totals
+            self.errorMessage = nil
         } catch {
-            self.errorMessage = error.localizedDescription
+            guard requestID == latestDailyDataRequestID else { return }
+            handleError(error)
         }
     }
 
     /// Complete AI Vision pipeline: Job creation -> Cloud Storage PUT -> SSE Stream -> Auto-log
     func analyzeAndLogMeal(jpegData: Data) async {
         guard let user = currentUser else { return }
+        // Prevent a second scan from starting (and possibly double-logging)
+        // while one is already in flight.
+        guard !isScanning else { return }
+
         self.isScanning = true
+        self.errorMessage = nil
         self.scanStatusText = "Initializing scan job..."
 
         do {
@@ -89,15 +140,20 @@ final class MacrofyAppViewModel: ObservableObject {
             try await client.uploadImageBinary(uploadUrl: job.uploadUrl, imageData: jpegData)
             self.scanStatusText = "AI Vision analyzing meal..."
 
-            // 3. Listen to SSE Pub/Sub
+            // 3. Listen to SSE Pub/Sub until a terminal status arrives.
+            var loggedEntry = false
             for try await update in await client.streamScanJobUpdates(jobId: job.jobId) {
+                if update.status == "failed" {
+                    throw MacrofyError.scanFailed(update.errorMessage ?? "AI vision was unable to analyze this photo.")
+                }
+
                 if let result = update.result {
                     self.scanStatusText = "Found \(result.name) (\(Int(result.calories)) kcal)"
-                    
+
                     // 4. Automatically save recognized food to diary
                     let input = DiaryEntryInput(
-                        date: "2026-10-08",
-                        mealType: .lunch,
+                        date: Self.diaryDateString(),
+                        mealType: Self.suggestedMealType(),
                         foodName: result.name,
                         servingSize: result.servingSize,
                         calories: result.calories,
@@ -108,16 +164,83 @@ final class MacrofyAppViewModel: ObservableObject {
                         addedMethod: .image
                     )
                     _ = try await client.addDiaryEntry(userId: user.id, entry: input)
+                    loggedEntry = true
                     break
                 }
             }
 
+            // The stream ended without ever delivering a result (e.g. the
+            // connection dropped or the watchdog timeout fired) — treat that
+            // as a failure rather than silently reporting success.
+            guard loggedEntry else {
+                throw MacrofyError.sseTimeout
+            }
+
             self.scanStatusText = "Completed!"
+            self.errorMessage = nil
             await loadDailyData()
         } catch {
-            self.errorMessage = error.localizedDescription
+            handleError(error)
+            self.scanStatusText = ""
         }
         self.isScanning = false
+    }
+
+    // MARK: - Shared Error Handling
+
+    /// Surfaces `error` to the UI. If the error indicates the session itself
+    /// is no longer valid, also resets authentication state so the user
+    /// returns to the connect screen instead of being stuck on an
+    /// authenticated view that can no longer load data.
+    private func handleError(_ error: Error) {
+        self.errorMessage = error.localizedDescription
+        if case MacrofyError.unauthorized = error {
+            self.isAuthenticated = false
+            self.currentUser = nil
+            self.diaryEntries = []
+            self.dailyTotals = nil
+        }
+    }
+
+    // MARK: - Helpers
+
+    /// Today's date formatted as `yyyy-MM-dd`, as required by the diary endpoints.
+    private static func diaryDateString(from date: Date = Date()) -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date)
+    }
+
+    /// Heuristically derives a meal category from the time of the scan. A
+    /// production app should let the user pick the meal (breakfast/lunch/
+    /// dinner/snacks) instead of guessing from the clock.
+    private static func suggestedMealType(from date: Date = Date()) -> MealType {
+        let hour = Calendar.current.component(.hour, from: date)
+        switch hour {
+        case 4..<11: return .breakfast
+        case 11..<16: return .lunch
+        case 16..<21: return .dinner
+        default: return .snacks
+        }
+    }
+
+    /// Generates (once) or loads a stable, device-local external user ID for
+    /// this QuickStart demo so separate installs don't share one Macrofy
+    /// diary. Replace with your real signed-in user's ID in production.
+    private static func loadOrCreateDemoUserId() -> String {
+        let key = "macrofy_demo_external_user_id"
+        if let data = KeychainStore.shared.read(key: key),
+           let existing = String(data: data, encoding: .utf8),
+           !existing.isEmpty {
+            return existing
+        }
+        let newId = "user_ios_\(UUID().uuidString.prefix(12))"
+        if let data = newId.data(using: .utf8) {
+            _ = KeychainStore.shared.save(key: key, data: data)
+        }
+        return newId
     }
 }
 
