@@ -21,38 +21,24 @@ final class MacrofyAppViewModel: ObservableObject {
     @Published var isScanning = false
     @Published var errorMessage: String?
 
-    // MARK: - Demo Identity
+    // MARK: - Credentials & Signature Input
     //
-    // `developerUserId` is a stable, per-install identifier generated once
-    // and persisted in the Keychain, so each install of this QuickStart gets
-    // its own isolated Macrofy user, profile, and diary rather than every
-    // install sharing one hardcoded ID. In a real app, replace this with the
-    // ID of your already-signed-in user (from your own account system)
-    // instead of a device-generated ID.
-    private let developerUserId: String
-
-    // MARK: - Development-Only Authentication
-    //
-    // `devAppSecret` only compiles into Debug builds running on the iOS
-    // Simulator, so the literal secret can never end up inside a
-    // distributable binary. `#if DEBUG` alone isn't sufficient: a Debug
-    // build can still be signed and installed on a physical device (e.g.
-    // shared ad hoc or via TestFlight), which would carry the real secret
-    // with it. Release, TestFlight, App Store, and even Debug builds on a
-    // physical device all get `nil` here, which forces `authenticate()`
-    // onto the error path below rather than silently shipping a usable
-    // client-side secret. Production apps must never embed `appSecret`
-    // client-side at all: have your backend compute the HMAC signature and
-    // return it to the device (see README "Secure Production Handshake").
-    #if DEBUG && targetEnvironment(simulator)
-    private let devAppSecret: String? = "YOUR_APP_SECRET"
-    #else
-    private let devAppSecret: String? = nil
-    #endif
+    // No sensitive secrets are stored or compiled into this app.
+    // Instead, compute an HMAC-SHA256 signature externally using
+    // `./scripts/generate_signature.swift <userId>` (which reads the secret
+    // from your shell environment) or via your backend, then paste the
+    // resulting signature here.
+    @Published var developerUserId: String
+    @Published var signatureInput: String = ""
 
     /// Identifies the most recently started `loadDailyData()` call so a
     /// slower, superseded refresh can't overwrite newer results.
     private var latestDailyDataRequestID: UUID?
+
+    /// Monotonically increasing counter for view-model auth updates.
+    /// Prevents a slow background `checkAuthentication()` or a superseded
+    /// 401 error from overwriting a newer published authenticated state.
+    private var authRequestGeneration: UInt64 = 0
 
     init() {
         let (id, persisted) = Self.loadOrCreateDemoUserId()
@@ -66,11 +52,16 @@ final class MacrofyAppViewModel: ObservableObject {
     }
 
     func checkAuthentication() async {
-        // Read authentication state and the current user together in one
-        // actor hop so they can't reflect two different moments in time
-        // (e.g. a concurrent connect/clear happening between two separate
-        // awaited reads).
+        authRequestGeneration &+= 1
+        let generation = authRequestGeneration
+
         let snapshot = await client.sessionSnapshot()
+
+        // Guard against an out-of-order snapshot application: if a newer
+        // auth operation has started since this check began, discard this
+        // result so it doesn't overwrite newer published state.
+        guard generation == authRequestGeneration else { return }
+
         self.isAuthenticated = snapshot.isAuthenticated
         self.currentUser = snapshot.user
         if snapshot.isAuthenticated {
@@ -81,27 +72,44 @@ final class MacrofyAppViewModel: ObservableObject {
     func authenticate() async {
         self.errorMessage = nil
 
-        guard let devAppSecret else {
-            self.errorMessage = "Client-side signing is disabled in this build. Implement the backend handshake described in the README before shipping."
+        let cleanUserId = developerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cleanSignature = signatureInput.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !cleanUserId.isEmpty else {
+            self.errorMessage = "User ID cannot be empty."
             return
         }
 
+        guard !cleanSignature.isEmpty else {
+            self.errorMessage = "Please enter an HMAC signature. Generate one using: ./scripts/generate_signature.swift \(cleanUserId)"
+            return
+        }
+
+        authRequestGeneration &+= 1
+
         do {
-            let signature = SignatureUtility.generateHMAC(
-                appSecret: devAppSecret,
-                userId: developerUserId
-            )
             let response = try await client.connect(
                 appId: AppConfig.appId,
-                userId: developerUserId,
-                signature: signature
+                userId: cleanUserId,
+                signature: cleanSignature
             )
             self.isAuthenticated = true
             self.currentUser = response.user
+            self.signatureInput = ""
             await loadDailyData()
         } catch {
             await handleError(error)
         }
+    }
+
+    func clearAuthentication() async {
+        authRequestGeneration &+= 1
+        await client.clearSession()
+        self.isAuthenticated = false
+        self.currentUser = nil
+        self.diaryEntries = []
+        self.dailyTotals = nil
+        self.errorMessage = nil
     }
 
     func loadDailyData() async {
@@ -115,13 +123,8 @@ final class MacrofyAppViewModel: ObservableObject {
             async let entriesTask = client.getDiaryEntries(userId: user.id, date: today)
             async let totalsTask = client.getDailyTotals(userId: user.id, date: today)
 
-            // Await both together so a failure in either one doesn't leave
-            // the UI showing a mix of new entries and stale totals (or vice
-            // versa) — we only assign once both have succeeded.
             let (entries, totals) = try await (entriesTask, totalsTask)
 
-            // A newer refresh may have started and finished while this one
-            // was in flight; don't let this stale result overwrite it.
             guard requestID == latestDailyDataRequestID else { return }
 
             self.diaryEntries = entries
@@ -136,8 +139,6 @@ final class MacrofyAppViewModel: ObservableObject {
     /// Complete AI Vision pipeline: Job creation -> Cloud Storage PUT -> SSE Stream -> Auto-log
     func analyzeAndLogMeal(jpegData: Data) async {
         guard let user = currentUser else { return }
-        // Prevent a second scan from starting (and possibly double-logging)
-        // while one is already in flight.
         guard !isScanning else { return }
 
         self.isScanning = true
@@ -163,21 +164,7 @@ final class MacrofyAppViewModel: ObservableObject {
                 if let result = update.result {
                     self.scanStatusText = "Found \(result.name) (\(Int(result.calories)) kcal)"
 
-                    // 4. Automatically save recognized food to diary.
-                    //
-                    // Note: if this specific addDiaryEntry call succeeds on
-                    // the server but its response is lost or fails to decode
-                    // locally, a manual retry (a fresh tap of the scan
-                    // button) will create a new scan job and post a second,
-                    // duplicate entry. We intentionally don't try to detect
-                    // and suppress that here: the Macrofy API has no
-                    // idempotency-key mechanism to tie a retry back to a
-                    // specific prior attempt, and a heuristic based on food
-                    // name + recent timestamp alone would also incorrectly
-                    // swallow a second, legitimate scan of the same food
-                    // eaten again shortly after the first — silently
-                    // dropping real data is worse than an occasional,
-                    // user-correctable duplicate entry.
+                    // 4. Automatically save recognized food to diary
                     let input = DiaryEntryInput(
                         date: Self.diaryDateString(),
                         mealType: Self.suggestedMealType(),
@@ -196,9 +183,6 @@ final class MacrofyAppViewModel: ObservableObject {
                 }
             }
 
-            // The stream ended without ever delivering a result (e.g. the
-            // connection dropped or the watchdog timeout fired) — treat that
-            // as a failure rather than silently reporting success.
             guard loggedEntry else {
                 throw MacrofyError.sseTimeout
             }
@@ -215,17 +199,15 @@ final class MacrofyAppViewModel: ObservableObject {
 
     // MARK: - Shared Error Handling
 
-    /// Surfaces `error` to the UI. If the error indicates the session itself
-    /// is no longer valid, re-checks the client's *actual current* session
-    /// before clearing view-model authentication state: a 401 can be thrown
-    /// for a request that used an old token even after a concurrent
-    /// `refreshSession()` has already installed a newer, valid one, and in
-    /// that case the client is still authenticated even though this
-    /// particular request failed.
     private func handleError(_ error: Error) async {
         self.errorMessage = error.localizedDescription
         if case MacrofyError.unauthorized = error {
+            authRequestGeneration &+= 1
+            let generation = authRequestGeneration
+
             let snapshot = await client.sessionSnapshot()
+            guard generation == authRequestGeneration else { return }
+
             if snapshot.isAuthenticated {
                 self.isAuthenticated = true
                 self.currentUser = snapshot.user
@@ -240,7 +222,6 @@ final class MacrofyAppViewModel: ObservableObject {
 
     // MARK: - Helpers
 
-    /// Today's date formatted as `yyyy-MM-dd`, as required by the diary endpoints.
     private static func diaryDateString(from date: Date = Date()) -> String {
         let formatter = DateFormatter()
         formatter.calendar = Calendar(identifier: .gregorian)
@@ -249,9 +230,6 @@ final class MacrofyAppViewModel: ObservableObject {
         return formatter.string(from: date)
     }
 
-    /// Heuristically derives a meal category from the time of the scan. A
-    /// production app should let the user pick the meal (breakfast/lunch/
-    /// dinner/snacks) instead of guessing from the clock.
     private static func suggestedMealType(from date: Date = Date()) -> MealType {
         let hour = Calendar.current.component(.hour, from: date)
         switch hour {
@@ -262,15 +240,6 @@ final class MacrofyAppViewModel: ObservableObject {
         }
     }
 
-    /// Generates (once) or loads a stable, device-local external user ID for
-    /// this QuickStart demo so separate installs don't share one Macrofy
-    /// diary. Replace with your real signed-in user's ID in production.
-    ///
-    /// Returns whether the ID is actually persisted in the Keychain. If
-    /// persistence fails even after a retry, the ID is still usable for the
-    /// current launch, but callers should warn that it won't survive a
-    /// relaunch (a new, different ID would otherwise be generated next
-    /// time, silently orphaning today's demo diary).
     private static func loadOrCreateDemoUserId() -> (id: String, persisted: Bool) {
         let key = "macrofy_demo_external_user_id"
         if let data = KeychainStore.shared.read(key: key),
@@ -283,8 +252,6 @@ final class MacrofyAppViewModel: ObservableObject {
         guard let data = newId.data(using: .utf8) else {
             return (newId, false)
         }
-        // Retry once in case of a transient Keychain failure before giving
-        // up and falling back to an ephemeral (non-persisted) ID.
         if KeychainStore.shared.save(key: key, data: data) {
             return (newId, true)
         }
@@ -302,18 +269,58 @@ struct ContentView: View {
         NavigationStack {
             VStack(spacing: 20) {
                 if !viewModel.isAuthenticated {
-                    VStack(spacing: 12) {
-                        Text("Macrofy Nutrition Engine")
-                            .font(.title2).bold()
-                        Text("Connect your session via HMAC Handshake")
-                            .font(.subheadline).foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(spacing: 16) {
+                            VStack(spacing: 6) {
+                                Text("Macrofy Nutrition Engine")
+                                    .font(.title2).bold()
+                                Text("Connect session via HMAC Handshake")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .padding(.top, 10)
 
-                        Button("Connect User") {
-                            Task { await viewModel.authenticate() }
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("External User ID")
+                                    .font(.caption).bold()
+                                    .foregroundStyle(.secondary)
+                                HStack {
+                                    TextField("User ID", text: $viewModel.developerUserId)
+                                        .textFieldStyle(.roundedBorder)
+                                        .textInputAutocapitalization(.never)
+                                        .autocorrectionDisabled()
+                                    Button {
+                                        UIPasteboard.general.string = viewModel.developerUserId
+                                    } label: {
+                                        Image(systemName: "doc.on.doc")
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
+                            }
+
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text("HMAC Signature")
+                                    .font(.caption).bold()
+                                    .foregroundStyle(.secondary)
+                                TextField("Paste 64-char hex signature", text: $viewModel.signatureInput)
+                                    .textFieldStyle(.roundedBorder)
+                                    .textInputAutocapitalization(.never)
+                                    .autocorrectionDisabled()
+                                    .font(.system(.body, design: .monospaced))
+
+                                Text("Generate in terminal: `./scripts/generate_signature.swift \(viewModel.developerUserId)`")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+
+                            Button("Connect User") {
+                                Task { await viewModel.authenticate() }
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .padding(.top, 8)
                         }
-                        .buttonStyle(.borderedProminent)
+                        .padding()
                     }
-                    .padding()
                 } else {
                     List {
                         Section("Daily Totals") {
@@ -333,16 +340,22 @@ struct ContentView: View {
                         }
 
                         Section("Logged Meals") {
-                            ForEach(viewModel.diaryEntries) { entry in
-                                HStack {
-                                    VStack(alignment: .leading) {
-                                        Text(entry.foodName).font(.body)
-                                        Text(entry.mealType.rawValue.capitalized)
-                                            .font(.caption).foregroundStyle(.secondary)
+                            if viewModel.diaryEntries.isEmpty {
+                                Text("No meals logged yet today.")
+                                    .font(.subheadline)
+                                    .foregroundStyle(.secondary)
+                            } else {
+                                ForEach(viewModel.diaryEntries) { entry in
+                                    HStack {
+                                        VStack(alignment: .leading) {
+                                            Text(entry.foodName).font(.body)
+                                            Text(entry.mealType.rawValue.capitalized)
+                                                .font(.caption).foregroundStyle(.secondary)
+                                        }
+                                        Spacer()
+                                        Text("\(Int(entry.calories ?? 0)) kcal")
+                                            .font(.subheadline).bold()
                                     }
-                                    Spacer()
-                                    Text("\(Int(entry.calories ?? 0)) kcal")
-                                        .font(.subheadline).bold()
                                 }
                             }
                         }
@@ -365,6 +378,12 @@ struct ContentView: View {
                                 }
                             }
                         }
+
+                        Section {
+                            Button("Disconnect Session", role: .destructive) {
+                                Task { await viewModel.clearAuthentication() }
+                            }
+                        }
                     }
                 }
 
@@ -379,10 +398,6 @@ struct ContentView: View {
         }
     }
 
-    /// Loads the bundled `sample_meal.png` demo asset and re-encodes it as
-    /// JPEG, since the scan pipeline is wired up for `image/jpeg` uploads
-    /// (the `Content-Type` sent here must match the one used to create the
-    /// scan job).
     private static func loadSampleMealJPEGData() -> Data? {
         guard let url = Bundle.main.url(forResource: "sample_meal", withExtension: "png"),
               let pngData = try? Data(contentsOf: url),

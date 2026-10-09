@@ -2,96 +2,117 @@ import Foundation
 
 public actor MacrofyClient {
     private let baseURL: URL
+    private let appId: String
     private let session: URLSession
     private let keychain = KeychainStore.shared
-    
-    private let tokenKey = "macrofy_jwt_token"
-    private let userKey = "macrofy_session_user"
+
+    /// Scoped Keychain key combining the app ID and host so different
+    /// tenants or environments (e.g. staging vs. prod) never share or
+    /// overwrite each other's credentials.
+    private let sessionKey: String
 
     private(set) public var currentToken: String?
     private(set) public var currentUser: SessionUser?
 
-    /// Incremented at the start of every `connect()`/`refreshSession()`
-    /// call so a slower, superseded call can detect that a newer
-    /// authentication operation has already taken effect.
+    /// Incremented whenever an auth operation starts OR when the session is
+    /// explicitly modified/cleared, so pending operations can detect that
+    /// their results have been superseded.
     private var authGeneration: UInt64 = 0
 
-    /// The generation number of the authentication call that most recently
-    /// installed a session via `setSession`. Unlike `authGeneration` (which
-    /// advances the moment a call *starts*), this only advances when a call
-    /// actually *succeeds* in installing a session, so a response is never
-    /// discarded just because a different, newer call happened to start (and
-    /// then fail) in the meantime.
+    /// The generation of the authentication call that most recently installed
+    /// a session via `setSession`. Only advances when a session is actually
+    /// installed or explicitly cleared/set, so older in-flight requests cannot
+    /// overwrite newer ones or resurrect credentials after logout.
     private var installedAuthGeneration: UInt64 = 0
 
-    public init(baseURL: URL = AppConfig.baseURL, session: URLSession = .shared) {
+    /// Atomic on-disk representation storing token and user together in a
+    /// single Keychain item, preventing concurrent writes from interleaving
+    /// a token with the wrong user.
+    private struct PersistedSession: Codable {
+        let token: String
+        let user: SessionUser
+    }
+
+    public init(
+        appId: String = AppConfig.appId,
+        baseURL: URL = AppConfig.baseURL,
+        session: URLSession = .shared
+    ) {
+        self.appId = appId
         self.baseURL = baseURL
         self.session = session
 
-        // Restore the token and user from Keychain on launch. Both must
-        // restore successfully for the session to be considered valid — a
-        // partially-restored session (e.g. a decodable token but a
-        // missing/corrupted user) would otherwise let `isAuthenticated`
-        // report true while there's no user to load data for.
-        let restoredToken = keychain.read(key: tokenKey).flatMap { String(data: $0, encoding: .utf8) }
-        let restoredUser = keychain.read(key: userKey).flatMap { try? JSONDecoder().decode(SessionUser.self, from: $0) }
+        // Derive a tenant- and host-scoped key (e.g. "session_app_FitCorp123_api.macrofy.com")
+        let host = baseURL.host ?? "default"
+        self.sessionKey = "macrofy_session_\(appId)_\(host)"
 
-        if let restoredToken, let restoredUser {
-            self.currentToken = restoredToken
-            self.currentUser = restoredUser
+        // Restore the token and user atomically from Keychain on launch.
+        // In addition to decoding successfully, the restored user's appId
+        // MUST match the configured appId — preventing an old tenant's
+        // session from being used after an App ID reconfiguration.
+        if let data = keychain.read(key: sessionKey),
+           let record = try? JSONDecoder().decode(PersistedSession.self, from: data),
+           record.user.appId == appId {
+            self.currentToken = record.token
+            self.currentUser = record.user
         } else {
             self.currentToken = nil
             self.currentUser = nil
-            if restoredToken != nil || restoredUser != nil {
-                // Clean up whichever half of the pair did restore so a
-                // future launch doesn't keep finding the same incomplete
-                // session.
-                keychain.delete(key: tokenKey)
-                keychain.delete(key: userKey)
-            }
+            // Clear any corrupted or mismatched record for this scope.
+            keychain.delete(key: sessionKey)
         }
     }
 
     // MARK: - Session Management
 
-    /// Persists the session in memory and in the Keychain.
+    /// Persists the session atomically in the Keychain and updates memory.
     ///
-    /// The in-memory session (`currentToken`/`currentUser`) is always set so
-    /// the current app run can proceed immediately. If Keychain persistence
-    /// fails or only partially succeeds, any partial write is rolled back so
-    /// a future relaunch never reads a mismatched token/user pair (which
-    /// would otherwise appear "authenticated" with no user to load data
-    /// for). The return value reports whether persistence fully succeeded.
+    /// If Keychain persistence fails, any previous in-memory session is
+    /// preserved so in-memory state matches what is actually stored, and
+    /// the call returns `false`. Calling this explicitly also advances
+    /// `authGeneration` so any in-flight `connect()` or `refreshSession()`
+    /// calls are marked superseded and will not overwrite this session.
     @discardableResult
     public func setSession(token: String, user: SessionUser) -> Bool {
+        // Enforce tenant boundary: cannot install a user belonging to a
+        // different appId than this client is configured for.
+        guard user.appId == self.appId else {
+            return false
+        }
+
+        // Advance auth generation to invalidate any in-flight auth requests
+        authGeneration &+= 1
+        installedAuthGeneration = authGeneration
+
+        let previousToken = self.currentToken
+        let previousUser = self.currentUser
+
+        let record = PersistedSession(token: token, user: user)
+        guard let data = try? JSONEncoder().encode(record),
+              keychain.save(key: sessionKey, data: data) else {
+            // Restore previous in-memory state on failure so memory and
+            // Keychain remain consistent.
+            self.currentToken = previousToken
+            self.currentUser = previousUser
+            return false
+        }
+
         self.currentToken = token
         self.currentUser = user
-
-        guard let tokenData = token.data(using: .utf8),
-              let userData = try? JSONEncoder().encode(user) else {
-            keychain.delete(key: tokenKey)
-            keychain.delete(key: userKey)
-            return false
-        }
-
-        let tokenSaved = keychain.save(key: tokenKey, data: tokenData)
-        let userSaved = keychain.save(key: userKey, data: userData)
-
-        guard tokenSaved && userSaved else {
-            // Avoid leaving a half-written session that would desync the
-            // token and user on the next launch.
-            keychain.delete(key: tokenKey)
-            keychain.delete(key: userKey)
-            return false
-        }
         return true
     }
 
+    /// Clears the session from memory and Keychain.
+    ///
+    /// Advances `authGeneration` so any in-flight `connect()` or
+    /// `refreshSession()` cannot resurrect credentials after logout.
     public func clearSession() {
+        authGeneration &+= 1
+        installedAuthGeneration = authGeneration
+
         self.currentToken = nil
         self.currentUser = nil
-        keychain.delete(key: tokenKey)
-        keychain.delete(key: userKey)
+        keychain.delete(key: sessionKey)
     }
 
     public var isAuthenticated: Bool {
@@ -99,11 +120,7 @@ public actor MacrofyClient {
     }
 
     /// Atomically reads whether the client is authenticated together with
-    /// the current user, in a single actor hop. Reading `isAuthenticated`
-    /// and `currentUser` as two separate awaited property accesses risks the
-    /// actor processing another call (e.g. a concurrent `clearSession()` or
-    /// `connect()`) in between, yielding an inconsistent combination of the
-    /// two from the caller's perspective.
+    /// the current user, in a single actor hop.
     public func sessionSnapshot() -> (isAuthenticated: Bool, user: SessionUser?) {
         (isAuthenticated, currentUser)
     }
@@ -136,8 +153,6 @@ public actor MacrofyClient {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         }
 
-        // Track which token (if any) this specific request used, so a 401
-        // response can be correlated back to it below.
         var requestToken: String?
         if requiresAuth {
             guard let token = currentToken else {
@@ -176,10 +191,7 @@ public actor MacrofyClient {
 
         case 401:
             // Only clear the session if it still holds the exact token that
-            // was rejected. A concurrent request may have already installed
-            // a newer, valid session (e.g. via refreshSession()); clearing
-            // unconditionally would discard that replacement session and
-            // force an unnecessary reconnect.
+            // was rejected.
             if let requestToken, requestToken == currentToken {
                 clearSession()
             }
@@ -248,24 +260,13 @@ public actor MacrofyClient {
     }
 
     /// Applies a `connect()`/`refreshSession()` response to the session,
-    /// guarding against two races:
-    /// - Staleness: only decline to install when a *strictly newer*
-    ///   authentication operation has already installed its own session —
-    ///   installing this response would then regress to older credentials.
-    ///   Comparing against `installedAuthGeneration` (not `authGeneration`)
-    ///   matters here: if a newer call merely *started* but failed before
-    ///   installing anything, this response is still the only valid session
-    ///   available and must be installed, or the caller would be told
-    ///   "success" while the client has no token at all.
-    /// - Persistence failure: if the Keychain write fails, this throws
-    ///   instead of silently reporting success, since the session would
-    ///   otherwise work only in memory and disappear on relaunch.
+    /// guarding against staleness and persistence failures.
     private func applyAuthResponse(_ response: AuthResponse, generation: UInt64) throws -> AuthResponse {
-        guard generation >= installedAuthGeneration else {
-            if let currentToken, let currentUser {
-                return AuthResponse(token: currentToken, user: currentUser)
-            }
-            return response
+        // If a newer auth operation has started or the session was explicitly
+        // changed/cleared since this call began, fail with sessionSuperseded
+        // rather than installing stale credentials or reporting false success.
+        guard generation >= installedAuthGeneration && generation == authGeneration else {
+            throw MacrofyError.sessionSuperseded
         }
 
         guard setSession(token: response.token, user: response.user) else {
@@ -274,7 +275,6 @@ public actor MacrofyClient {
                 message: "Authenticated successfully, but failed to persist the session securely. Please try again."
             )
         }
-        installedAuthGeneration = generation
         return response
     }
 
@@ -335,20 +335,6 @@ public actor MacrofyClient {
     }
 
     /// Subscribes to real-time status updates via Server-Sent Events (SSE).
-    ///
-    /// A watchdog cancels the underlying connection if no terminal
-    /// (`completed`/`failed`) update arrives within `timeout` seconds, so
-    /// callers never wait indefinitely; the stream throws
-    /// `MacrofyError.sseTimeout` in that case. If the caller stops iterating
-    /// the stream early (for example, after it has already found a result),
-    /// `onTermination` cancels the producer task so the underlying network
-    /// connection doesn't keep running in the background. A 401 response is
-    /// mapped to `MacrofyError.unauthorized` (instead of a generic
-    /// `.serverError`) and, if it still matches the token this request used,
-    /// clears the session — keeping parity with the REST pipeline so a
-    /// rejected/expired token during a scan also resets authentication state
-    /// instead of leaving the UI stuck on an authenticated screen with a
-    /// dead session.
     public func streamScanJobUpdates(jobId: String, timeout: TimeInterval = 60) -> AsyncThrowingStream<ImageScanStatusUpdate, Error> {
         let streamURL = baseURL.appendingPathComponent("v1/scan/image/\(jobId)/stream")
         let token = self.currentToken
@@ -412,9 +398,6 @@ public actor MacrofyClient {
                 producerTask.cancel()
             }
 
-            // Fires when the stream finishes, is cancelled, or the consumer
-            // stops iterating and releases it — ensures the network request
-            // and watchdog never outlive interest in their results.
             continuation.onTermination = { _ in
                 producerTask.cancel()
                 watchdogTask.cancel()

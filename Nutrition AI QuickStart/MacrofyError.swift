@@ -18,6 +18,7 @@ public nonisolated enum MacrofyError: LocalizedError, Sendable {
     case uploadFailed(statusCode: Int)
     case sseTimeout
     case scanFailed(String)
+    case sessionSuperseded
 
     public var errorDescription: String? {
         switch self {
@@ -48,6 +49,8 @@ public nonisolated enum MacrofyError: LocalizedError, Sendable {
             return "AI Image scan timed out waiting for server completion."
         case .scanFailed(let message):
             return "Image analysis failed: \(message)"
+        case .sessionSuperseded:
+            return "Authentication was superseded by a newer session update."
         }
     }
 }

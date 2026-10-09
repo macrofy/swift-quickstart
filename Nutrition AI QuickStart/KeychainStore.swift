@@ -3,11 +3,14 @@ import Security
 
 nonisolated final class KeychainStore: @unchecked Sendable {
     static let shared = KeychainStore()
-    private let service = "com.macrofy.sdk.session"
+    private let defaultService: String
 
-    private init() {}
+    init(service: String = "com.macrofy.sdk.session") {
+        self.defaultService = service
+    }
 
-    func save(key: String, data: Data) -> Bool {
+    func save(key: String, data: Data, service: String? = nil) -> Bool {
+        let activeService = service ?? defaultService
         // Identity-only query: used to find and remove any existing item for
         // this account. Including kSecValueData here would make the delete's
         // search require an exact match on the *old* value, so an update
@@ -15,7 +18,7 @@ nonisolated final class KeychainStore: @unchecked Sendable {
         // item and the following add would then fail as a duplicate.
         let searchQuery: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
+            kSecAttrService as String: activeService,
             kSecAttrAccount as String: key
         ]
         SecItemDelete(searchQuery as CFDictionary)
@@ -27,10 +30,11 @@ nonisolated final class KeychainStore: @unchecked Sendable {
         return SecItemAdd(addQuery as CFDictionary, nil) == errSecSuccess
     }
 
-    func read(key: String) -> Data? {
+    func read(key: String, service: String? = nil) -> Data? {
+        let activeService = service ?? defaultService
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
+            kSecAttrService as String: activeService,
             kSecAttrAccount as String: key,
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
@@ -43,19 +47,21 @@ nonisolated final class KeychainStore: @unchecked Sendable {
         return data
     }
 
-    func delete(key: String) {
+    func delete(key: String, service: String? = nil) {
+        let activeService = service ?? defaultService
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service,
+            kSecAttrService as String: activeService,
             kSecAttrAccount as String: key
         ]
         SecItemDelete(query as CFDictionary)
     }
 
-    func clear() {
+    func clear(service: String? = nil) {
+        let activeService = service ?? defaultService
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: service
+            kSecAttrService as String: activeService
         ]
         SecItemDelete(query as CFDictionary)
     }
