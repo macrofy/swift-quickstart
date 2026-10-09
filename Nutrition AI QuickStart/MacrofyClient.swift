@@ -16,6 +16,14 @@ public actor MacrofyClient {
     /// authentication operation has already taken effect.
     private var authGeneration: UInt64 = 0
 
+    /// The generation number of the authentication call that most recently
+    /// installed a session via `setSession`. Unlike `authGeneration` (which
+    /// advances the moment a call *starts*), this only advances when a call
+    /// actually *succeeds* in installing a session, so a response is never
+    /// discarded just because a different, newer call happened to start (and
+    /// then fail) in the meantime.
+    private var installedAuthGeneration: UInt64 = 0
+
     public init(baseURL: URL = AppConfig.baseURL, session: URLSession = .shared) {
         self.baseURL = baseURL
         self.session = session
@@ -88,6 +96,16 @@ public actor MacrofyClient {
 
     public var isAuthenticated: Bool {
         currentToken != nil && currentUser != nil
+    }
+
+    /// Atomically reads whether the client is authenticated together with
+    /// the current user, in a single actor hop. Reading `isAuthenticated`
+    /// and `currentUser` as two separate awaited property accesses risks the
+    /// actor processing another call (e.g. a concurrent `clearSession()` or
+    /// `connect()`) in between, yielding an inconsistent combination of the
+    /// two from the caller's perspective.
+    public func sessionSnapshot() -> (isAuthenticated: Bool, user: SessionUser?) {
+        (isAuthenticated, currentUser)
     }
 
     // MARK: - Generic Request Pipeline
@@ -231,16 +249,19 @@ public actor MacrofyClient {
 
     /// Applies a `connect()`/`refreshSession()` response to the session,
     /// guarding against two races:
-    /// - Staleness: if a newer authentication operation has started (and
-    ///   possibly already completed) since this one began, applying this
-    ///   older response would silently replace newer credentials. In that
-    ///   case, the session this call's caller observes is whatever the
-    ///   newer operation installed, not this response.
+    /// - Staleness: only decline to install when a *strictly newer*
+    ///   authentication operation has already installed its own session —
+    ///   installing this response would then regress to older credentials.
+    ///   Comparing against `installedAuthGeneration` (not `authGeneration`)
+    ///   matters here: if a newer call merely *started* but failed before
+    ///   installing anything, this response is still the only valid session
+    ///   available and must be installed, or the caller would be told
+    ///   "success" while the client has no token at all.
     /// - Persistence failure: if the Keychain write fails, this throws
     ///   instead of silently reporting success, since the session would
     ///   otherwise work only in memory and disappear on relaunch.
     private func applyAuthResponse(_ response: AuthResponse, generation: UInt64) throws -> AuthResponse {
-        guard generation == authGeneration else {
+        guard generation >= installedAuthGeneration else {
             if let currentToken, let currentUser {
                 return AuthResponse(token: currentToken, user: currentUser)
             }
@@ -253,6 +274,7 @@ public actor MacrofyClient {
                 message: "Authenticated successfully, but failed to persist the session securely. Please try again."
             )
         }
+        installedAuthGeneration = generation
         return response
     }
 

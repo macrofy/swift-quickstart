@@ -1,6 +1,6 @@
 # Macrofy iOS QuickStart Guide
 
-Official native Swift & SwiftUI starter kit for Macrofy. Embed AI meal vision, barcode resolution, and nutrition tracking into iOS apps against the live Macrofy API (`api-v0`).
+Official native Swift & SwiftUI starter kit for Macrofy. The bundled `MacrofyClient` SDK supports AI meal vision, barcode resolution, food search, user profiles, and nutrition tracking against the live Macrofy API (`api-v0`). The included demo app exercises the authentication, AI meal scan, and diary/daily-totals workflows end-to-end; Provides copy-in code examples for barcode scanning, food search, and profile management to add to your own screens.
 
 ---
 
@@ -67,7 +67,7 @@ let response = try await client.connect(
 ```
 Upon a successful connect call, `MacrofyClient` automatically stores the 30-day Bearer JWT in the iOS Keychain and injects `Authorization: Bearer <token>` into all subsequent authenticated requests.
 
-> **Security note**: `devAppSecret` in `ContentView.swift` is wrapped in `#if DEBUG`, so it is always `nil` — and therefore never compiled into the binary — for Release/TestFlight/App Store builds. `SignatureUtility.generateHMAC` uses `appSecret` exactly as issued by the Developer Portal — its literal UTF-8 bytes are the HMAC key, even though the secret is formatted as a hex-looking string; do not hex-decode it first, or every signature will be rejected. Because `HMAC_SHA256(appSecret, userId)` is deterministic, treat any generated signature as sensitive and short-lived: generate it immediately before calling `connect`, never log it, and prefer proxying this exchange through your backend (Step 5 below) so the secret and signature never reach the client at all.
+> **Security note**: `devAppSecret` in `ContentView.swift` is wrapped in `#if DEBUG && targetEnvironment(simulator)`, so it only ever has a real value in Simulator Debug builds — Release, TestFlight, App Store, and even Debug builds installed on a physical device all get `nil` and never compile the secret in at all. (`#if DEBUG` alone isn't sufficient, since a Debug build can still be signed and distributed to a physical device.) `SignatureUtility.generateHMAC` uses `appSecret` exactly as issued by the Developer Portal — its literal UTF-8 bytes are the HMAC key, even though the secret is formatted as a hex-looking string; do not hex-decode it first, or every signature will be rejected. Because `HMAC_SHA256(appSecret, userId)` is deterministic, treat any generated signature as sensitive and short-lived: generate it immediately before calling `connect`, never log it, and prefer proxying this exchange through your backend (Step 5 below) so the secret and signature never reach the client at all.
 
 ### 3. Food Diary & Daily Progress
 `MacrofyAppViewModel.loadDailyData()` fetches diary entries and daily aggregate totals in parallel:
@@ -90,14 +90,14 @@ The application demonstrates the full meal analysis lifecycle via `analyzeAndLog
 ## 4. Setup & Running the QuickStart
 
 ### Prerequisites
-- macOS Sonoma or later
-- Xcode 15.0+ or Xcode 16.0+
-- iOS Deployment Target: iOS 16.0+ (iOS 17.0+ recommended)
+- A Mac running a macOS release compatible with Xcode 26.1 or later (see Apple's Xcode release notes for exact requirements)
+- Xcode 26.1 or later — this project's `.xcodeproj` uses a project file format (and Swift concurrency build settings) that older Xcode versions cannot open or compile
+- iOS Deployment Target: iOS 26.1+
 
 ### Quick Run Steps
 1. Open `Nutrition AI QuickStart.xcodeproj` in Xcode.
 2. Open `Configuration.swift` and replace `"YOUR_APP_ID"` with your registered Application ID from the Macrofy Developer Portal.
-3. Open `ContentView.swift` and locate `devAppSecret` inside `MacrofyAppViewModel`. Replace `"YOUR_APP_SECRET"` with your 64-character development secret. This value is wrapped in `#if DEBUG`, so it only exists in Debug builds — Release/TestFlight/App Store builds always get `nil` and must use the backend handshake described in Step 5 of Section 5 below.
+3. Open `ContentView.swift` and locate `devAppSecret` inside `MacrofyAppViewModel`. Replace `"YOUR_APP_SECRET"` with your 64-character development secret. This value is wrapped in `#if DEBUG && targetEnvironment(simulator)`, so it only exists in Simulator Debug builds — Release, TestFlight, App Store, and even Debug builds on a physical device always get `nil` and must use the backend handshake described in Step 5 of Section 5 below.
 4. Select an iOS Simulator (e.g., iPhone 16 Pro) and press **Cmd + R** to run.
 5. In the simulator:
    - Tap **Connect User** to execute the cryptographic handshake.
@@ -108,7 +108,7 @@ The application demonstrates the full meal analysis lifecycle via `analyzeAndLog
 
 ## 5. How to Build on Top of This Project
 
-Here are the concrete steps to evolve this QuickStart into a full production application:
+The steps below are client-library code examples, not features of the bundled demo screen — copy them into your own SwiftUI views to exercise the parts of the `MacrofyClient` SDK (barcode scanning, food search, and profile management) that the demo app doesn't showcase directly. Use them as the starting point for evolving this QuickStart into a full production application:
 
 ### Step 1: Replace Sample Image with Real Camera / Photo Picker
 In `ContentView.swift`, the AI scan demo currently uses mock JPEG bytes. Replace this with SwiftUI's `PhotosPicker` or `AVCaptureSession`:
@@ -212,7 +212,7 @@ func updateUserProfile(userId: String) async throws {
 ```
 
 ### Step 5: Secure Production Handshake (Backend Architecture)
-For production releases, **never send `appSecret`, or the HMAC signature it produces, to the iOS client**. `HMAC_SHA256(appSecret, userId)` is deterministic, so anyone who captures the signature in transit could replay it to request another 30-day JWT for that user. The fix is to keep the *entire* handshake — including the call to `POST /api/auth/connect` itself — on your backend, and return only the resulting JWT to the device:
+For production releases, **never send `appSecret`, or the HMAC signature it produces, to the iOS client**. `HMAC_SHA256(appSecret, userId)` is deterministic, so anyone who captures the signature in transit could replay it to request another 30-day JWT for that user. The fix is to keep the *entire* handshake — including the call to `POST /api/auth/connect` itself — on your backend:
 
 ```
 iOS Client                     Your Backend                  Macrofy API
@@ -224,12 +224,22 @@ iOS Client                     Your Backend                  Macrofy API
     |                               | 3. POST /api/auth/connect   |
     |                               |    (appId, userId, signature)
     |                               |---------------------------->|
-    |                               | 4. Returns 30-Day Bearer JWT|
+    |                               | 4. Returns { token, user }  |
     |                               |<-----------------------------|
-    | 5. Returns JWT only           |                             |
+    | 5. Returns { token, user }    |                             |
     |<-------------------------------|                             |
 ```
-With this flow, neither `appSecret` nor the signature it produces ever reaches the device — only the resulting JWT does — which eliminates the signature-replay risk entirely. If you need additional protection against a compromised network path, ask Macrofy support whether `POST /api/auth/connect` supports a challenge/nonce option.
+Your backend must forward **both** fields from Macrofy's response — not just the JWT. The iOS client needs the `SessionUser` object (specifically `user.id`) for every diary and profile call, so a JWT alone isn't enough to use the rest of the SDK. Install the backend's response directly on the device instead of calling `client.connect(...)` (which performs its own client-side call to Macrofy's `/api/auth/connect` — exactly what this flow avoids):
+```swift
+struct BackendSessionResponse: Decodable {
+    let token: String
+    let user: SessionUser
+}
+
+let backendResponse = try await yourBackendClient.requestSession(userId: developerUserId) // returns BackendSessionResponse
+await client.setSession(token: backendResponse.token, user: backendResponse.user)
+```
+With this flow, neither `appSecret` nor the signature it produces ever reaches the device — only the resulting `{ token, user }` pair does — which eliminates the signature-replay risk entirely while still giving the client everything it needs. If you need additional protection against a compromised network path, ask Macrofy support whether `POST /api/auth/connect` supports a challenge/nonce option.
 
 ### Step 6: Token Auto-Refresh
 Before the 30-day JWT expires, call `client.refreshSession()` to maintain continuous authentication without requiring the user to reconnect:

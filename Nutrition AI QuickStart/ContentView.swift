@@ -29,18 +29,22 @@ final class MacrofyAppViewModel: ObservableObject {
     // install sharing one hardcoded ID. In a real app, replace this with the
     // ID of your already-signed-in user (from your own account system)
     // instead of a device-generated ID.
-    private let developerUserId: String = MacrofyAppViewModel.loadOrCreateDemoUserId()
+    private let developerUserId: String
 
     // MARK: - Development-Only Authentication
     //
-    // `devAppSecret` only compiles into DEBUG builds, so the literal secret
-    // can never end up inside a Release/TestFlight/App Store binary. In
-    // Release builds this is always `nil`, which forces `authenticate()`
+    // `devAppSecret` only compiles into Debug builds running on the iOS
+    // Simulator, so the literal secret can never end up inside a
+    // distributable binary. `#if DEBUG` alone isn't sufficient: a Debug
+    // build can still be signed and installed on a physical device (e.g.
+    // shared ad hoc or via TestFlight), which would carry the real secret
+    // with it. Release, TestFlight, App Store, and even Debug builds on a
+    // physical device all get `nil` here, which forces `authenticate()`
     // onto the error path below rather than silently shipping a usable
     // client-side secret. Production apps must never embed `appSecret`
     // client-side at all: have your backend compute the HMAC signature and
     // return it to the device (see README "Secure Production Handshake").
-    #if DEBUG
+    #if DEBUG && targetEnvironment(simulator)
     private let devAppSecret: String? = "YOUR_APP_SECRET"
     #else
     private let devAppSecret: String? = nil
@@ -51,17 +55,25 @@ final class MacrofyAppViewModel: ObservableObject {
     private var latestDailyDataRequestID: UUID?
 
     init() {
+        let (id, persisted) = Self.loadOrCreateDemoUserId()
+        self.developerUserId = id
+        if !persisted {
+            self.errorMessage = "Could not save a stable demo user ID to the Keychain. Your demo diary may not persist across launches."
+        }
         Task {
             await checkAuthentication()
         }
     }
 
     func checkAuthentication() async {
-        let authState = await client.isAuthenticated
-        let user = await client.currentUser
-        self.isAuthenticated = authState
-        self.currentUser = user
-        if authState {
+        // Read authentication state and the current user together in one
+        // actor hop so they can't reflect two different moments in time
+        // (e.g. a concurrent connect/clear happening between two separate
+        // awaited reads).
+        let snapshot = await client.sessionSnapshot()
+        self.isAuthenticated = snapshot.isAuthenticated
+        self.currentUser = snapshot.user
+        if snapshot.isAuthenticated {
             await loadDailyData()
         }
     }
@@ -88,7 +100,7 @@ final class MacrofyAppViewModel: ObservableObject {
             self.currentUser = response.user
             await loadDailyData()
         } catch {
-            handleError(error)
+            await handleError(error)
         }
     }
 
@@ -117,7 +129,7 @@ final class MacrofyAppViewModel: ObservableObject {
             self.errorMessage = nil
         } catch {
             guard requestID == latestDailyDataRequestID else { return }
-            handleError(error)
+            await handleError(error)
         }
     }
 
@@ -151,22 +163,23 @@ final class MacrofyAppViewModel: ObservableObject {
                 if let result = update.result {
                     self.scanStatusText = "Found \(result.name) (\(Int(result.calories)) kcal)"
 
-                    let today = Self.diaryDateString()
-
-                    // Guard against a duplicate entry if a previous scan
-                    // attempt's addDiaryEntry call actually committed on the
-                    // server but its response was lost or failed to decode
-                    // locally — which would otherwise surface as a failure
-                    // here and invite the user to retry, posting the same
-                    // meal a second time.
-                    if await diaryAlreadyLogged(foodName: result.name, userId: user.id, date: today) {
-                        loggedEntry = true
-                        break
-                    }
-
-                    // 4. Automatically save recognized food to diary
+                    // 4. Automatically save recognized food to diary.
+                    //
+                    // Note: if this specific addDiaryEntry call succeeds on
+                    // the server but its response is lost or fails to decode
+                    // locally, a manual retry (a fresh tap of the scan
+                    // button) will create a new scan job and post a second,
+                    // duplicate entry. We intentionally don't try to detect
+                    // and suppress that here: the Macrofy API has no
+                    // idempotency-key mechanism to tie a retry back to a
+                    // specific prior attempt, and a heuristic based on food
+                    // name + recent timestamp alone would also incorrectly
+                    // swallow a second, legitimate scan of the same food
+                    // eaten again shortly after the first — silently
+                    // dropping real data is worse than an occasional,
+                    // user-correctable duplicate entry.
                     let input = DiaryEntryInput(
-                        date: today,
+                        date: Self.diaryDateString(),
                         mealType: Self.suggestedMealType(),
                         foodName: result.name,
                         servingSize: result.servingSize,
@@ -194,7 +207,7 @@ final class MacrofyAppViewModel: ObservableObject {
             self.errorMessage = nil
             await loadDailyData()
         } catch {
-            handleError(error)
+            await handleError(error)
             self.scanStatusText = ""
         }
         self.isScanning = false
@@ -203,16 +216,25 @@ final class MacrofyAppViewModel: ObservableObject {
     // MARK: - Shared Error Handling
 
     /// Surfaces `error` to the UI. If the error indicates the session itself
-    /// is no longer valid, also resets authentication state so the user
-    /// returns to the connect screen instead of being stuck on an
-    /// authenticated view that can no longer load data.
-    private func handleError(_ error: Error) {
+    /// is no longer valid, re-checks the client's *actual current* session
+    /// before clearing view-model authentication state: a 401 can be thrown
+    /// for a request that used an old token even after a concurrent
+    /// `refreshSession()` has already installed a newer, valid one, and in
+    /// that case the client is still authenticated even though this
+    /// particular request failed.
+    private func handleError(_ error: Error) async {
         self.errorMessage = error.localizedDescription
         if case MacrofyError.unauthorized = error {
-            self.isAuthenticated = false
-            self.currentUser = nil
-            self.diaryEntries = []
-            self.dailyTotals = nil
+            let snapshot = await client.sessionSnapshot()
+            if snapshot.isAuthenticated {
+                self.isAuthenticated = true
+                self.currentUser = snapshot.user
+            } else {
+                self.isAuthenticated = false
+                self.currentUser = nil
+                self.diaryEntries = []
+                self.dailyTotals = nil
+            }
         }
     }
 
@@ -240,58 +262,36 @@ final class MacrofyAppViewModel: ObservableObject {
         }
     }
 
-    /// Best-effort reconciliation to avoid logging a duplicate entry if a
-    /// previous scan attempt's `addDiaryEntry` call actually succeeded on
-    /// the server but its response was lost or failed to decode locally.
-    /// This is a heuristic (matching on food name + recent timestamp), not a
-    /// server-enforced idempotency guarantee — the Macrofy API documented
-    /// here has no idempotency-key mechanism to rely on instead. If the
-    /// reconciliation check itself fails, this assumes "not yet logged" so a
-    /// transient read error doesn't block a legitimate new scan.
-    private func diaryAlreadyLogged(foodName: String, userId: String, date: String) async -> Bool {
-        guard let recentEntries = try? await client.getDiaryEntries(userId: userId, date: date) else {
-            return false
-        }
-        let reconciliationWindow: TimeInterval = 120
-        let now = Date()
-        return recentEntries.contains { entry in
-            guard entry.foodName == foodName,
-                  entry.addedMethod == .image,
-                  let createdAt = Self.parseISO8601(entry.createdAt) else {
-                return false
-            }
-            return now.timeIntervalSince(createdAt) <= reconciliationWindow
-        }
-    }
-
-    /// Parses an ISO-8601 timestamp as returned by the API, with or without
-    /// fractional seconds.
-    private static func parseISO8601(_ string: String) -> Date? {
-        let withFractional = ISO8601DateFormatter()
-        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        if let date = withFractional.date(from: string) {
-            return date
-        }
-        let standard = ISO8601DateFormatter()
-        standard.formatOptions = [.withInternetDateTime]
-        return standard.date(from: string)
-    }
-
     /// Generates (once) or loads a stable, device-local external user ID for
     /// this QuickStart demo so separate installs don't share one Macrofy
     /// diary. Replace with your real signed-in user's ID in production.
-    private static func loadOrCreateDemoUserId() -> String {
+    ///
+    /// Returns whether the ID is actually persisted in the Keychain. If
+    /// persistence fails even after a retry, the ID is still usable for the
+    /// current launch, but callers should warn that it won't survive a
+    /// relaunch (a new, different ID would otherwise be generated next
+    /// time, silently orphaning today's demo diary).
+    private static func loadOrCreateDemoUserId() -> (id: String, persisted: Bool) {
         let key = "macrofy_demo_external_user_id"
         if let data = KeychainStore.shared.read(key: key),
            let existing = String(data: data, encoding: .utf8),
            !existing.isEmpty {
-            return existing
+            return (existing, true)
         }
+
         let newId = "user_ios_\(UUID().uuidString.prefix(12))"
-        if let data = newId.data(using: .utf8) {
-            _ = KeychainStore.shared.save(key: key, data: data)
+        guard let data = newId.data(using: .utf8) else {
+            return (newId, false)
         }
-        return newId
+        // Retry once in case of a transient Keychain failure before giving
+        // up and falling back to an ephemeral (non-persisted) ID.
+        if KeychainStore.shared.save(key: key, data: data) {
+            return (newId, true)
+        }
+        if KeychainStore.shared.save(key: key, data: data) {
+            return (newId, true)
+        }
+        return (newId, false)
     }
 }
 
