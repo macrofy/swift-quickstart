@@ -13,6 +13,11 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
     private var installedAuthGenerations: [String: UInt64] = [:]
     private var inFlightRefreshCounts: [String: Int] = [:]
 
+    /// Tracks tokens that received a 401 while a token refresh was in flight.
+    /// If all in-flight refreshes fail without replacing the session, these
+    /// tokens are cleared so a rejected token does not remain active.
+    private var pendingRejectedTokens: [String: Set<String>] = [:]
+
     struct PersistedSession: Codable {
         let token: String
         let user: SessionUser
@@ -99,6 +104,7 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
         }
 
         sessions[key] = (token, user)
+        pendingRejectedTokens[key] = []
 
         // Advance auth generations so any earlier in-flight request is rejected
         let nextGen = max(authGenerations[key] ?? 0, generation ?? ((authGenerations[key] ?? 0) &+ 1))
@@ -127,14 +133,19 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
             return .tokenMismatch
         }
 
-        // If a refresh is in flight for this scope and ignoreIfRefreshing is true, do not clear.
+        // If a refresh is in flight for this scope and ignoreIfRefreshing is true,
+        // record the rejected token so it will be cleared if all in-flight refreshes fail.
         if ignoreIfRefreshing && (inFlightRefreshCounts[key] ?? 0) > 0 {
+            if let matchingToken {
+                pendingRejectedTokens[key, default: []].insert(matchingToken)
+            }
             return .refreshInFlight
         }
 
         // Always invalidate in-memory credentials and advance generations so earlier
         // in-flight requests are rejected and rejected tokens can never remain active.
         sessions[key] = (nil, nil)
+        pendingRejectedTokens[key] = []
         let nextGen = (authGenerations[key] ?? 0) &+ 1
         authGenerations[key] = nextGen
         installedAuthGenerations[key] = nextGen
@@ -155,12 +166,32 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
         inFlightRefreshCounts[key, default: 0] += 1
     }
 
-    /// Decrements the in-flight refresh counter for `key`.
-    func endRefresh(for key: String) {
+    /// Decrements the in-flight refresh counter for `key`. If all in-flight refreshes
+    /// have finished without installing a replacement session, and the active token was
+    /// rejected with 401 while refresh was in flight, clears the session immediately.
+    func endRefresh(for key: String, using keychain: KeychainStore) {
         lock.lock()
         defer { lock.unlock() }
         let current = inFlightRefreshCounts[key, default: 1]
-        inFlightRefreshCounts[key] = max(0, current - 1)
+        let newCount = max(0, current - 1)
+        inFlightRefreshCounts[key] = newCount
+
+        if newCount == 0 {
+            if let activeToken = sessions[key]?.token,
+               let pending = pendingRejectedTokens[key],
+               pending.contains(activeToken) {
+                sessions[key] = (nil, nil)
+                let nextGen = (authGenerations[key] ?? 0) &+ 1
+                authGenerations[key] = nextGen
+                installedAuthGenerations[key] = nextGen
+
+                let deleted = keychain.delete(key: key)
+                if !deleted {
+                    _ = keychain.save(key: key, data: Data())
+                }
+            }
+            pendingRejectedTokens[key] = []
+        }
     }
 
     /// Decrements the in-flight refresh counter for `key`, and if no other refresh is
@@ -179,6 +210,7 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
 
         if newCount == 0 && sessions[key]?.token == rejectedToken {
             sessions[key] = (nil, nil)
+            pendingRejectedTokens[key] = []
             let nextGen = (authGenerations[key] ?? 0) &+ 1
             authGenerations[key] = nextGen
             installedAuthGenerations[key] = nextGen
@@ -344,7 +376,7 @@ public actor MacrofyClient {
 
         case 401:
             // Atomically clear the session ONLY if the rejected token is still current,
-            // and no token refresh is currently in flight.
+            // or record it if a refresh is in flight to clear if the refresh fails.
             if let requestToken {
                 _ = SessionRegistry.shared.clearSessionIfMatching(
                     token: requestToken,
@@ -420,7 +452,7 @@ public actor MacrofyClient {
                 body: nil,
                 requiresAuth: true
             )
-            SessionRegistry.shared.endRefresh(for: sessionKey)
+            SessionRegistry.shared.endRefresh(for: sessionKey, using: keychain)
             refreshHandled = true
             return try applyAuthResponse(response, generation: generation)
         } catch {
@@ -433,7 +465,7 @@ public actor MacrofyClient {
                 refreshHandled = true
             }
             if !refreshHandled {
-                SessionRegistry.shared.endRefresh(for: sessionKey)
+                SessionRegistry.shared.endRefresh(for: sessionKey, using: keychain)
             }
             throw error
         }
