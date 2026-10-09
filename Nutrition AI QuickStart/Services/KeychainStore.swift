@@ -6,17 +6,18 @@ nonisolated final class KeychainStore: @unchecked Sendable {
     private let defaultService: String
     private let lock = NSLock()
 
+    enum ReadResult {
+        case success(Data)
+        case notFound
+        case failure(OSStatus)
+    }
+
     init(service: String = "com.macrofy.sdk.session") {
         self.defaultService = service
     }
 
     /// Atomically updates an existing Keychain item in-place, or inserts it
     /// if it does not exist yet.
-    ///
-    /// Rather than deleting the existing item first (which leaves a window where
-    /// a failed insert loses the existing credentials, or concurrent saves can
-    /// clobber each other), this uses `SecItemUpdate` first. If the item does not
-    /// exist (`errSecItemNotFound`), it falls back to `SecItemAdd`.
     func save(key: String, data: Data, service: String? = nil) -> Bool {
         lock.lock()
         defer { lock.unlock() }
@@ -33,13 +34,11 @@ nonisolated final class KeychainStore: @unchecked Sendable {
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
 
-        // 1. Attempt in-place atomic update
         let updateStatus = SecItemUpdate(query as CFDictionary, updateAttributes as CFDictionary)
         if updateStatus == errSecSuccess {
             return true
         }
 
-        // 2. If item does not exist yet, add it
         if updateStatus == errSecItemNotFound {
             var addQuery = query
             addQuery[kSecValueData as String] = data
@@ -50,7 +49,9 @@ nonisolated final class KeychainStore: @unchecked Sendable {
         return false
     }
 
-    func read(key: String, service: String? = nil) -> Data? {
+    /// Reads an item from Keychain, distinguishing a genuinely missing item (`.notFound`)
+    /// from a transient error (`.failure`, e.g. device locked before first unlock).
+    func readResult(key: String, service: String? = nil) -> ReadResult {
         lock.lock()
         defer { lock.unlock() }
 
@@ -63,11 +64,25 @@ nonisolated final class KeychainStore: @unchecked Sendable {
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else {
-            return nil
+        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        switch status {
+        case errSecSuccess:
+            if let data = item as? Data {
+                return .success(data)
+            }
+            return .notFound
+        case errSecItemNotFound:
+            return .notFound
+        default:
+            return .failure(status)
         }
-        return data
+    }
+
+    func read(key: String, service: String? = nil) -> Data? {
+        if case .success(let data) = readResult(key: key, service: service) {
+            return data
+        }
+        return nil
     }
 
     @discardableResult

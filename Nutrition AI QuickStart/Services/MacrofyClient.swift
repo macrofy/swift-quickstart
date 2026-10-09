@@ -32,19 +32,28 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
     }
 
     /// Ensures the session for `key` is loaded from Keychain and validated against `expectedAppId`.
+    /// Distinguishes a genuinely missing item (`.notFound`) from a transient access error (`.failure`,
+    /// e.g. device locked before first unlock) so temporary read failures do not cache an empty session.
     func restoreIfNeeded(for key: String, expectedAppId: String, using keychain: KeychainStore) {
         lock.lock()
         defer { lock.unlock() }
 
         guard sessions[key] == nil else { return }
 
-        if let data = keychain.read(key: key),
-           let record = try? JSONDecoder().decode(PersistedSession.self, from: data),
-           record.user.appId == expectedAppId {
-            sessions[key] = (record.token, record.user)
-        } else {
-            keychain.delete(key: key)
+        switch keychain.readResult(key: key) {
+        case .success(let data):
+            if let record = try? JSONDecoder().decode(PersistedSession.self, from: data),
+               record.user.appId == expectedAppId {
+                sessions[key] = (record.token, record.user)
+            } else {
+                keychain.delete(key: key)
+                sessions[key] = (nil, nil)
+            }
+        case .notFound:
             sessions[key] = (nil, nil)
+        case .failure:
+            // Do not delete and do not cache (nil, nil) on transient access errors
+            break
         }
     }
 
@@ -67,7 +76,7 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
 
     /// Atomically checks generation and saves the session to Keychain + registry.
     /// If generation < installedAuthGeneration, rejects with `.superseded` without modifying storage.
-    /// Advances `installedAuthGenerations` ONLY after Keychain persistence succeeds.
+    /// Advances `authGenerations` and `installedAuthGenerations` ONLY after Keychain persistence succeeds.
     func saveSessionIfCurrent(
         token: String,
         user: SessionUser,
@@ -90,13 +99,17 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
         }
 
         sessions[key] = (token, user)
-        let targetGen = generation ?? ((authGenerations[key] ?? 0) &+ 1)
-        installedAuthGenerations[key] = max(currentInstalled, targetGen)
+
+        // Advance auth generations so any earlier in-flight request is rejected
+        let nextGen = max(authGenerations[key] ?? 0, generation ?? ((authGenerations[key] ?? 0) &+ 1))
+        authGenerations[key] = nextGen
+        installedAuthGenerations[key] = nextGen
         return .success
     }
 
     /// Atomically clears the session ONLY IF `matchingToken` matches the currently installed token
-    /// (or if `matchingToken == nil`), AND no token refresh is currently in flight for this scope.
+    /// (or if `matchingToken == nil`). In-memory credentials are always invalidated so rejected
+    /// tokens cannot remain active even if Keychain deletion encounters an error.
     func clearSessionIfMatching(
         token matchingToken: String?,
         ignoreIfRefreshing: Bool = true,
@@ -114,10 +127,17 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
             return .tokenMismatch
         }
 
-        // If a refresh is in flight for this scope, do not clear the expiring token.
+        // If a refresh is in flight for this scope and ignoreIfRefreshing is true, do not clear.
         if ignoreIfRefreshing && (inFlightRefreshCounts[key] ?? 0) > 0 {
             return .refreshInFlight
         }
+
+        // Always invalidate in-memory credentials and advance generations so earlier
+        // in-flight requests are rejected and rejected tokens can never remain active.
+        sessions[key] = (nil, nil)
+        let nextGen = (authGenerations[key] ?? 0) &+ 1
+        authGenerations[key] = nextGen
+        installedAuthGenerations[key] = nextGen
 
         let deleted = keychain.delete(key: key)
         let fallbackOverwritten = !deleted ? keychain.save(key: key, data: Data()) : false
@@ -125,9 +145,6 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
         guard deleted || fallbackOverwritten else {
             return .persistenceFailed
         }
-
-        sessions[key] = (nil, nil)
-        installedAuthGenerations[key] = (authGenerations[key] ?? 0) &+ 1
         return .cleared
     }
 
@@ -144,6 +161,13 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
         defer { lock.unlock() }
         let current = inFlightRefreshCounts[key, default: 1]
         inFlightRefreshCounts[key] = max(0, current - 1)
+    }
+
+    /// Returns whether any refresh is currently in flight for `key`.
+    func isRefreshing(for key: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return (inFlightRefreshCounts[key] ?? 0) > 0
     }
 }
 
@@ -229,6 +253,7 @@ public actor MacrofyClient {
     /// Atomically reads whether the client is authenticated together with
     /// the current token and user, in a single synchronized registry lookup.
     public func sessionSnapshot() -> (isAuthenticated: Bool, token: String?, user: SessionUser?) {
+        SessionRegistry.shared.restoreIfNeeded(for: sessionKey, expectedAppId: appId, using: keychain)
         let (token, user) = SessionRegistry.shared.getSessionSnapshot(for: sessionKey)
         let authed = (token != nil && user != nil)
         return (authed, authed ? token : nil, authed ? user : nil)
@@ -380,10 +405,11 @@ public actor MacrofyClient {
             return try applyAuthResponse(response, generation: generation)
         } catch {
             if case MacrofyError.unauthorized = error {
-                if let requestToken {
+                // If another refresh is still in flight for this scope, do not clear.
+                if let requestToken, !SessionRegistry.shared.isRefreshing(for: sessionKey) {
                     _ = SessionRegistry.shared.clearSessionIfMatching(
                         token: requestToken,
-                        ignoreIfRefreshing: false,
+                        ignoreIfRefreshing: true,
                         for: sessionKey,
                         using: keychain
                     )

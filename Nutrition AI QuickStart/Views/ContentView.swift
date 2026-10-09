@@ -120,7 +120,20 @@ final class MacrofyAppViewModel: ObservableObject {
             await loadDailyData()
         } catch {
             guard generation == authRequestGeneration else { return }
-            await handleError(error)
+
+            // Reconcile with the client's actual session: an overlapping connect
+            // may have succeeded and installed a valid session!
+            let snapshot = await client.sessionSnapshot()
+            guard generation == authRequestGeneration else { return }
+
+            if snapshot.isAuthenticated {
+                self.isAuthenticated = true
+                self.currentUser = snapshot.user
+                self.errorMessage = nil
+                await loadDailyData()
+            } else {
+                await handleError(error)
+            }
         }
     }
 
@@ -198,6 +211,13 @@ final class MacrofyAppViewModel: ObservableObject {
         self.errorMessage = nil
         self.scanStatusText = "Initializing scan job..."
 
+        defer {
+            self.isScanning = false
+            if !isAuthenticated || Task.isCancelled {
+                self.scanStatusText = ""
+            }
+        }
+
         do {
             try Task.checkCancellation()
             guard isAuthenticated else { return }
@@ -268,7 +288,6 @@ final class MacrofyAppViewModel: ObservableObject {
             await handleError(error)
             self.scanStatusText = ""
         }
-        self.isScanning = false
     }
 
     // MARK: - Shared Error Handling
