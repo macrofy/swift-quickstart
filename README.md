@@ -145,7 +145,7 @@ func handleBarcodeDetected(_ barcode: String) async {
     let cleanCode = barcode.filter { $0.isNumber }
     do {
         let food = try await client.scanBarcode(barcode: cleanCode)
-        print("Scanned product: \(food.name), Calories: \(food.macros.energy)")
+        print("Scanned product: \(food.name), Calories: \(food.macros.energy ?? 0)")
     } catch {
         print("Barcode lookup failed: \(error.localizedDescription)")
     }
@@ -168,7 +168,7 @@ struct FoodSearchView: View {
                 if let brand = food.brand {
                     Text(brand).font(.subheadline).foregroundStyle(.secondary)
                 }
-                Text("\(Int(food.macros.energy)) kcal | P: \(Int(food.macros.protein))g")
+                Text("\(Int(food.macros.energy ?? 0)) kcal | P: \(Int(food.macros.protein ?? 0))g")
                     .font(.caption)
             }
         }
@@ -200,8 +200,7 @@ func updateUserProfile(userId: String) async throws {
     let input = UserProfileInput(
         age: 30,
         gender: .male,
-        heightFeet: 5,
-        heightInches: 10,
+        height: HeightImperial(feet: 5, inches: 10), // must be a complete pair, or omitted entirely
         weight: 175,
         activityLevel: .moderate,
         calorieDeficit: .maintain,
@@ -213,24 +212,24 @@ func updateUserProfile(userId: String) async throws {
 ```
 
 ### Step 5: Secure Production Handshake (Backend Architecture)
-For production releases, **never store `devAppSecret` inside the iOS binary**. Instead, route authentication through your secure backend:
+For production releases, **never send `appSecret`, or the HMAC signature it produces, to the iOS client**. `HMAC_SHA256(appSecret, userId)` is deterministic, so anyone who captures the signature in transit could replay it to request another 30-day JWT for that user. The fix is to keep the *entire* handshake — including the call to `POST /api/auth/connect` itself — on your backend, and return only the resulting JWT to the device:
 
 ```
 iOS Client                     Your Backend                  Macrofy API
-    │                               │                             │
-    │ 1. Request Signature          │                             │
-    │──────────────────────────────>│                             │
-    │                               │ 2. Compute HMAC SHA-256     │
-    │                               │    using appSecret          │
-    │ 3. Return signature           │                             │
-    │<──────────────────────────────│                             │
-    │                                                             │
-    │ 4. POST /api/auth/connect(appId, userId, signature)         │
-    │────────────────────────────────────────────────────────────>│
-    │ 5. Returns 30-Day Bearer JWT                                │
-    │<────────────────────────────────────────────────────────────│
+    |                               |                             |
+    | 1. Request session (userId)   |                             |
+    |------------------------------>|                             |
+    |                               | 2. Compute HMAC SHA-256     |
+    |                               |    using appSecret          |
+    |                               | 3. POST /api/auth/connect   |
+    |                               |    (appId, userId, signature)
+    |                               |---------------------------->|
+    |                               | 4. Returns 30-Day Bearer JWT|
+    |                               |<-----------------------------|
+    | 5. Returns JWT only           |                             |
+    |<-------------------------------|                             |
 ```
-Because `HMAC_SHA256(appSecret, userId)` is deterministic, a captured signature could be replayed to request another fresh JWT for that user. Keep this entire exchange server-side so the secret and signature never reach the client, and ask Macrofy support whether `POST /api/auth/connect` supports a challenge/nonce option if you need additional defense against replay from a compromised network path.
+With this flow, neither `appSecret` nor the signature it produces ever reaches the device — only the resulting JWT does — which eliminates the signature-replay risk entirely. If you need additional protection against a compromised network path, ask Macrofy support whether `POST /api/auth/connect` supports a challenge/nonce option.
 
 ### Step 6: Token Auto-Refresh
 Before the 30-day JWT expires, call `client.refreshSession()` to maintain continuous authentication without requiring the user to reconnect:
@@ -250,7 +249,7 @@ func refreshTokenIfNeeded() async {
 ## 6. API Guidelines & Guardrails
 
 1. **Empty Body Header Constraint**: Fastify returns `400 Bad Request` if `Content-Type: application/json` is sent on `GET` or `DELETE` requests that have no body. `MacrofyClient.execute` already guards against this by checking `if let body = body`.
-2. **Height Field Pairing**: `heightFeet` and `heightInches` in `UserProfileInput` must always be sent together or both set to `nil`.
+2. **Height Field Pairing**: The API persists height as a single value server-side, so `heightFeet` and `heightInches` must always be sent together or omitted entirely. `UserProfileInput.height: HeightImperial?` enforces this at the type level — construct it via `HeightImperial(feet:inches:)` or leave it `nil`; there is no way to set only one component.
 3. **Date Formatting**: Diary endpoints expect strict `YYYY-MM-DD` string format (e.g., `2026-10-08`). Do not send full ISO-8601 timestamps with times.
 4. **Barcode Validation**: Barcode lookups require 7 to 14 numeric characters. Always strip spaces, hyphens, and letters prior to making requests.
 5. **Cloud Storage Upload Content-Type**: The `Content-Type` specified when creating a scan job (e.g., `image/jpeg`) must match the `Content-Type` header passed in the direct binary `PUT` upload.

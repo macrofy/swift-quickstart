@@ -150,9 +150,22 @@ final class MacrofyAppViewModel: ObservableObject {
                 if let result = update.result {
                     self.scanStatusText = "Found \(result.name) (\(Int(result.calories)) kcal)"
 
+                    let today = Self.diaryDateString()
+
+                    // Guard against a duplicate entry if a previous scan
+                    // attempt's addDiaryEntry call actually committed on the
+                    // server but its response was lost or failed to decode
+                    // locally — which would otherwise surface as a failure
+                    // here and invite the user to retry, posting the same
+                    // meal a second time.
+                    if await diaryAlreadyLogged(foodName: result.name, userId: user.id, date: today) {
+                        loggedEntry = true
+                        break
+                    }
+
                     // 4. Automatically save recognized food to diary
                     let input = DiaryEntryInput(
-                        date: Self.diaryDateString(),
+                        date: today,
                         mealType: Self.suggestedMealType(),
                         foodName: result.name,
                         servingSize: result.servingSize,
@@ -224,6 +237,43 @@ final class MacrofyAppViewModel: ObservableObject {
         case 16..<21: return .dinner
         default: return .snacks
         }
+    }
+
+    /// Best-effort reconciliation to avoid logging a duplicate entry if a
+    /// previous scan attempt's `addDiaryEntry` call actually succeeded on
+    /// the server but its response was lost or failed to decode locally.
+    /// This is a heuristic (matching on food name + recent timestamp), not a
+    /// server-enforced idempotency guarantee — the Macrofy API documented
+    /// here has no idempotency-key mechanism to rely on instead. If the
+    /// reconciliation check itself fails, this assumes "not yet logged" so a
+    /// transient read error doesn't block a legitimate new scan.
+    private func diaryAlreadyLogged(foodName: String, userId: String, date: String) async -> Bool {
+        guard let recentEntries = try? await client.getDiaryEntries(userId: userId, date: date) else {
+            return false
+        }
+        let reconciliationWindow: TimeInterval = 120
+        let now = Date()
+        return recentEntries.contains { entry in
+            guard entry.foodName == foodName,
+                  entry.addedMethod == .image,
+                  let createdAt = Self.parseISO8601(entry.createdAt) else {
+                return false
+            }
+            return now.timeIntervalSince(createdAt) <= reconciliationWindow
+        }
+    }
+
+    /// Parses an ISO-8601 timestamp as returned by the API, with or without
+    /// fractional seconds.
+    private static func parseISO8601(_ string: String) -> Date? {
+        let withFractional = ISO8601DateFormatter()
+        withFractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFractional.date(from: string) {
+            return date
+        }
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        return standard.date(from: string)
     }
 
     /// Generates (once) or loads a stable, device-local external user ID for

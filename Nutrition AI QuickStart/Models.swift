@@ -36,11 +36,15 @@ public nonisolated struct ServingSize: Codable, Equatable, Sendable {
     public let label: String?
 }
 
+// `macrofy_products.calories100g/protein100g/carbs100g/fat100g/fiber100g/
+// sugars100g/sodium100g` are all nullable columns (no NOT NULL constraint in
+// postgres_schema.sql), so every field here must be optional — a product
+// with incomplete nutrition data would otherwise fail to decode entirely.
 public nonisolated struct Macros: Codable, Equatable, Sendable {
-    public let energy: Double // kcal
-    public let protein: Double // grams
-    public let fat: Double // grams
-    public let carbohydrates: Double // grams
+    public let energy: Double? // kcal
+    public let protein: Double? // grams
+    public let fat: Double? // grams
+    public let carbohydrates: Double? // grams
     public let fiber: Double?
     public let sugar: Double?
     public let sodium: Double? // milligrams
@@ -50,8 +54,11 @@ public nonisolated struct FoodItem: Codable, Identifiable, Equatable, Sendable {
     public let id: String
     public let name: String
     public let brand: String?
-    public let barcode: String?
-    public let servingSize: ServingSize
+    // macrofy_products.barcode is NOT NULL.
+    public let barcode: String
+    // macrofy_products.serving_size_grams/serving_label/serving_size_raw are
+    // all nullable, so a product can have no serving size info at all.
+    public let servingSize: ServingSize?
     public let macros: Macros
     public let macrosPer100g: Macros?
     public let source: String
@@ -149,19 +156,111 @@ public nonisolated enum DietType: String, Codable, Sendable {
     case keto
 }
 
+/// A paired imperial height measurement.
+///
+/// `user_profiles.height_cm` is stored server-side as a single integer
+/// column (see `postgres_schema.sql`); the API's client-facing
+/// `heightFeet`/`heightInches` fields are just an imperial view of that one
+/// value. Because a partial pair (only feet, or only inches) can never be
+/// converted to a valid centimeter value, the API rejects it — representing
+/// height as one paired type here (instead of two independent optionals)
+/// makes it impossible to construct or encode a half-complete height.
+public nonisolated struct HeightImperial: Equatable, Sendable {
+    public let feet: Int
+    public let inches: Int
+
+    public init(feet: Int, inches: Int) {
+        self.feet = feet
+        self.inches = inches
+    }
+}
+
 public nonisolated struct UserProfile: Codable, Equatable, Sendable {
     public let userId: String
-    public let name: String
+    // user_profiles.name is nullable.
+    public let name: String?
     public let age: Int?
     public let gender: Gender?
-    public let heightFeet: Int?
-    public let heightInches: Int?
+    /// Paired `heightFeet`/`heightInches` from the API, or `nil` if neither
+    /// was set. See `HeightImperial`.
+    public let height: HeightImperial?
     public let weight: Int? // Imperial lbs
     public let activityLevel: ActivityLevel?
     public let calorieDeficit: CalorieDeficit?
     public let dietType: DietType?
     public let waterLevel: Int? // ml
-    public let updatedAt: String?
+    // user_profiles.updated_at is NOT NULL (defaults to now()).
+    public let updatedAt: String
+
+    private enum CodingKeys: String, CodingKey {
+        case userId, name, age, gender, weight
+        case heightFeet, heightInches
+        case activityLevel, calorieDeficit, dietType, waterLevel, updatedAt
+    }
+
+    public init(
+        userId: String,
+        name: String? = nil,
+        age: Int? = nil,
+        gender: Gender? = nil,
+        height: HeightImperial? = nil,
+        weight: Int? = nil,
+        activityLevel: ActivityLevel? = nil,
+        calorieDeficit: CalorieDeficit? = nil,
+        dietType: DietType? = nil,
+        waterLevel: Int? = nil,
+        updatedAt: String
+    ) {
+        self.userId = userId
+        self.name = name
+        self.age = age
+        self.gender = gender
+        self.height = height
+        self.weight = weight
+        self.activityLevel = activityLevel
+        self.calorieDeficit = calorieDeficit
+        self.dietType = dietType
+        self.waterLevel = waterLevel
+        self.updatedAt = updatedAt
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        userId = try container.decode(String.self, forKey: .userId)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        age = try container.decodeIfPresent(Int.self, forKey: .age)
+        gender = try container.decodeIfPresent(Gender.self, forKey: .gender)
+        if let feet = try container.decodeIfPresent(Int.self, forKey: .heightFeet),
+           let inches = try container.decodeIfPresent(Int.self, forKey: .heightInches) {
+            height = HeightImperial(feet: feet, inches: inches)
+        } else {
+            // A response with only one of the two fields set is treated as
+            // "no height data" rather than failing the whole decode.
+            height = nil
+        }
+        weight = try container.decodeIfPresent(Int.self, forKey: .weight)
+        activityLevel = try container.decodeIfPresent(ActivityLevel.self, forKey: .activityLevel)
+        calorieDeficit = try container.decodeIfPresent(CalorieDeficit.self, forKey: .calorieDeficit)
+        dietType = try container.decodeIfPresent(DietType.self, forKey: .dietType)
+        waterLevel = try container.decodeIfPresent(Int.self, forKey: .waterLevel)
+        updatedAt = try container.decode(String.self, forKey: .updatedAt)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(userId, forKey: .userId)
+        try container.encodeIfPresent(name, forKey: .name)
+        try container.encodeIfPresent(age, forKey: .age)
+        try container.encodeIfPresent(gender, forKey: .gender)
+        try container.encodeIfPresent(height?.feet, forKey: .heightFeet)
+        try container.encodeIfPresent(height?.inches, forKey: .heightInches)
+        try container.encodeIfPresent(weight, forKey: .weight)
+        try container.encodeIfPresent(activityLevel, forKey: .activityLevel)
+        try container.encodeIfPresent(calorieDeficit, forKey: .calorieDeficit)
+        try container.encodeIfPresent(dietType, forKey: .dietType)
+        try container.encodeIfPresent(waterLevel, forKey: .waterLevel)
+        try container.encode(updatedAt, forKey: .updatedAt)
+    }
 }
 
 public nonisolated struct DailyGoals: Codable, Equatable, Sendable {
@@ -182,20 +281,27 @@ public nonisolated struct UserProfileInput: Codable, Sendable {
     public var name: String?
     public var age: Int?
     public var gender: Gender?
-    public var heightFeet: Int?
-    public var heightInches: Int?
+    /// Paired `heightFeet`/`heightInches`. Represented as a single optional
+    /// value (rather than two independent optionals) so it is impossible to
+    /// construct or encode a half-complete height — see `HeightImperial`.
+    public var height: HeightImperial?
     public var weight: Int?
     public var activityLevel: ActivityLevel?
     public var calorieDeficit: CalorieDeficit?
     public var dietType: DietType?
     public var waterLevel: Int?
 
+    private enum CodingKeys: String, CodingKey {
+        case name, age, gender, weight
+        case heightFeet, heightInches
+        case activityLevel, calorieDeficit, dietType, waterLevel
+    }
+
     public init(
         name: String? = nil,
         age: Int? = nil,
         gender: Gender? = nil,
-        heightFeet: Int? = nil,
-        heightInches: Int? = nil,
+        height: HeightImperial? = nil,
         weight: Int? = nil,
         activityLevel: ActivityLevel? = nil,
         calorieDeficit: CalorieDeficit? = nil,
@@ -205,13 +311,44 @@ public nonisolated struct UserProfileInput: Codable, Sendable {
         self.name = name
         self.age = age
         self.gender = gender
-        self.heightFeet = heightFeet
-        self.heightInches = heightInches
+        self.height = height
         self.weight = weight
         self.activityLevel = activityLevel
         self.calorieDeficit = calorieDeficit
         self.dietType = dietType
         self.waterLevel = waterLevel
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decodeIfPresent(String.self, forKey: .name)
+        age = try container.decodeIfPresent(Int.self, forKey: .age)
+        gender = try container.decodeIfPresent(Gender.self, forKey: .gender)
+        if let feet = try container.decodeIfPresent(Int.self, forKey: .heightFeet),
+           let inches = try container.decodeIfPresent(Int.self, forKey: .heightInches) {
+            height = HeightImperial(feet: feet, inches: inches)
+        } else {
+            height = nil
+        }
+        weight = try container.decodeIfPresent(Int.self, forKey: .weight)
+        activityLevel = try container.decodeIfPresent(ActivityLevel.self, forKey: .activityLevel)
+        calorieDeficit = try container.decodeIfPresent(CalorieDeficit.self, forKey: .calorieDeficit)
+        dietType = try container.decodeIfPresent(DietType.self, forKey: .dietType)
+        waterLevel = try container.decodeIfPresent(Int.self, forKey: .waterLevel)
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(name, forKey: .name)
+        try container.encodeIfPresent(age, forKey: .age)
+        try container.encodeIfPresent(gender, forKey: .gender)
+        try container.encodeIfPresent(height?.feet, forKey: .heightFeet)
+        try container.encodeIfPresent(height?.inches, forKey: .heightInches)
+        try container.encodeIfPresent(weight, forKey: .weight)
+        try container.encodeIfPresent(activityLevel, forKey: .activityLevel)
+        try container.encodeIfPresent(calorieDeficit, forKey: .calorieDeficit)
+        try container.encodeIfPresent(dietType, forKey: .dietType)
+        try container.encodeIfPresent(waterLevel, forKey: .waterLevel)
     }
 }
 

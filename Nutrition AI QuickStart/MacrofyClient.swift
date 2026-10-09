@@ -11,18 +11,36 @@ public actor MacrofyClient {
     private(set) public var currentToken: String?
     private(set) public var currentUser: SessionUser?
 
+    /// Incremented at the start of every `connect()`/`refreshSession()`
+    /// call so a slower, superseded call can detect that a newer
+    /// authentication operation has already taken effect.
+    private var authGeneration: UInt64 = 0
+
     public init(baseURL: URL = AppConfig.baseURL, session: URLSession = .shared) {
         self.baseURL = baseURL
         self.session = session
 
-        // Restore token from Keychain on launch
-        if let tokenData = keychain.read(key: tokenKey),
-           let token = String(data: tokenData, encoding: .utf8) {
-            self.currentToken = token
-        }
-        if let userData = keychain.read(key: userKey),
-           let user = try? JSONDecoder().decode(SessionUser.self, from: userData) {
-            self.currentUser = user
+        // Restore the token and user from Keychain on launch. Both must
+        // restore successfully for the session to be considered valid — a
+        // partially-restored session (e.g. a decodable token but a
+        // missing/corrupted user) would otherwise let `isAuthenticated`
+        // report true while there's no user to load data for.
+        let restoredToken = keychain.read(key: tokenKey).flatMap { String(data: $0, encoding: .utf8) }
+        let restoredUser = keychain.read(key: userKey).flatMap { try? JSONDecoder().decode(SessionUser.self, from: $0) }
+
+        if let restoredToken, let restoredUser {
+            self.currentToken = restoredToken
+            self.currentUser = restoredUser
+        } else {
+            self.currentToken = nil
+            self.currentUser = nil
+            if restoredToken != nil || restoredUser != nil {
+                // Clean up whichever half of the pair did restore so a
+                // future launch doesn't keep finding the same incomplete
+                // session.
+                keychain.delete(key: tokenKey)
+                keychain.delete(key: userKey)
+            }
         }
     }
 
@@ -69,7 +87,7 @@ public actor MacrofyClient {
     }
 
     public var isAuthenticated: Bool {
-        currentToken != nil
+        currentToken != nil && currentUser != nil
     }
 
     // MARK: - Generic Request Pipeline
@@ -180,28 +198,61 @@ public actor MacrofyClient {
 
     /// Exchanges HMAC-SHA256 signature for a Bearer JWT session token.
     public func connect(appId: String, userId: String, signature: String) async throws -> AuthResponse {
+        authGeneration &+= 1
+        let generation = authGeneration
+
         let req = ConnectRequest(appId: appId, userId: userId, signature: signature)
         let body = try JSONEncoder().encode(req)
-        
+
         let response: AuthResponse = try await execute(
             path: "api/auth/connect",
             method: "POST",
             body: body,
             requiresAuth: false
         )
-        setSession(token: response.token, user: response.user)
-        return response
+
+        return try applyAuthResponse(response, generation: generation)
     }
 
     /// Refreshes the active Bearer JWT token before expiration.
     public func refreshSession() async throws -> AuthResponse {
+        authGeneration &+= 1
+        let generation = authGeneration
+
         let response: AuthResponse = try await execute(
             path: "api/auth/refresh",
             method: "POST",
             body: nil,
             requiresAuth: true
         )
-        setSession(token: response.token, user: response.user)
+
+        return try applyAuthResponse(response, generation: generation)
+    }
+
+    /// Applies a `connect()`/`refreshSession()` response to the session,
+    /// guarding against two races:
+    /// - Staleness: if a newer authentication operation has started (and
+    ///   possibly already completed) since this one began, applying this
+    ///   older response would silently replace newer credentials. In that
+    ///   case, the session this call's caller observes is whatever the
+    ///   newer operation installed, not this response.
+    /// - Persistence failure: if the Keychain write fails, this throws
+    ///   instead of silently reporting success, since the session would
+    ///   otherwise work only in memory and disappear on relaunch.
+    private func applyAuthResponse(_ response: AuthResponse, generation: UInt64) throws -> AuthResponse {
+        guard generation == authGeneration else {
+            if let currentToken, let currentUser {
+                return AuthResponse(token: currentToken, user: currentUser)
+            }
+            return response
+        }
+
+        guard setSession(token: response.token, user: response.user) else {
+            throw MacrofyError.serverError(
+                statusCode: 0,
+                message: "Authenticated successfully, but failed to persist the session securely. Please try again."
+            )
+        }
         return response
     }
 
@@ -269,7 +320,13 @@ public actor MacrofyClient {
     /// `MacrofyError.sseTimeout` in that case. If the caller stops iterating
     /// the stream early (for example, after it has already found a result),
     /// `onTermination` cancels the producer task so the underlying network
-    /// connection doesn't keep running in the background.
+    /// connection doesn't keep running in the background. A 401 response is
+    /// mapped to `MacrofyError.unauthorized` (instead of a generic
+    /// `.serverError`) and, if it still matches the token this request used,
+    /// clears the session — keeping parity with the REST pipeline so a
+    /// rejected/expired token during a scan also resets authentication state
+    /// instead of leaving the UI stuck on an authenticated screen with a
+    /// dead session.
     public func streamScanJobUpdates(jobId: String, timeout: TimeInterval = 60) -> AsyncThrowingStream<ImageScanStatusUpdate, Error> {
         let streamURL = baseURL.appendingPathComponent("v1/scan/image/\(jobId)/stream")
         let token = self.currentToken
@@ -280,7 +337,7 @@ public actor MacrofyClient {
                 var request = URLRequest(url: streamURL)
                 request.httpMethod = "GET"
                 request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
-                if let token = token {
+                if let token {
                     request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
                 }
 
@@ -288,7 +345,14 @@ public actor MacrofyClient {
                     let (asyncBytes, response) = try await session.bytes(for: request)
                     guard let httpResponse = response as? HTTPURLResponse, (200...299).contains(httpResponse.statusCode) else {
                         let code = (response as? HTTPURLResponse)?.statusCode ?? 500
-                        continuation.finish(throwing: MacrofyError.serverError(statusCode: code, message: "SSE Connection failed"))
+                        if code == 401 {
+                            if let token, self.currentToken == token {
+                                self.clearSession()
+                            }
+                            continuation.finish(throwing: MacrofyError.unauthorized(message: "Session expired or invalid"))
+                        } else {
+                            continuation.finish(throwing: MacrofyError.serverError(statusCode: code, message: "SSE Connection failed"))
+                        }
                         return
                     }
 
