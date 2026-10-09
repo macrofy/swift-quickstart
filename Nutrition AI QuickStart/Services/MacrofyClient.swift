@@ -163,11 +163,31 @@ private nonisolated final class SessionRegistry: @unchecked Sendable {
         inFlightRefreshCounts[key] = max(0, current - 1)
     }
 
-    /// Returns whether any refresh is currently in flight for `key`.
-    func isRefreshing(for key: String) -> Bool {
+    /// Decrements the in-flight refresh counter for `key`, and if no other refresh is
+    /// running and `rejectedToken` matches the currently installed token, clears the session.
+    func endRefreshAndClearIfUnauthorized(
+        rejectedToken: String,
+        for key: String,
+        using keychain: KeychainStore
+    ) {
         lock.lock()
         defer { lock.unlock() }
-        return (inFlightRefreshCounts[key] ?? 0) > 0
+
+        let current = inFlightRefreshCounts[key, default: 1]
+        let newCount = max(0, current - 1)
+        inFlightRefreshCounts[key] = newCount
+
+        if newCount == 0 && sessions[key]?.token == rejectedToken {
+            sessions[key] = (nil, nil)
+            let nextGen = (authGenerations[key] ?? 0) &+ 1
+            authGenerations[key] = nextGen
+            installedAuthGenerations[key] = nextGen
+
+            let deleted = keychain.delete(key: key)
+            if !deleted {
+                _ = keychain.save(key: key, data: Data())
+            }
+        }
     }
 }
 
@@ -240,7 +260,7 @@ public actor MacrofyClient {
         if result == .persistenceFailed {
             throw MacrofyError.serverError(
                 statusCode: 0,
-                message: "Failed to remove stored session from Keychain."
+                message: "Session cleared from memory, but failed to remove credentials from Keychain."
             )
         }
         return result == .cleared
@@ -391,9 +411,7 @@ public actor MacrofyClient {
         let generation = SessionRegistry.shared.nextAuthGeneration(for: sessionKey)
 
         SessionRegistry.shared.beginRefresh(for: sessionKey)
-        defer {
-            SessionRegistry.shared.endRefresh(for: sessionKey)
-        }
+        var refreshHandled = false
 
         do {
             let response: AuthResponse = try await execute(
@@ -402,18 +420,20 @@ public actor MacrofyClient {
                 body: nil,
                 requiresAuth: true
             )
+            SessionRegistry.shared.endRefresh(for: sessionKey)
+            refreshHandled = true
             return try applyAuthResponse(response, generation: generation)
         } catch {
-            if case MacrofyError.unauthorized = error {
-                // If another refresh is still in flight for this scope, do not clear.
-                if let requestToken, !SessionRegistry.shared.isRefreshing(for: sessionKey) {
-                    _ = SessionRegistry.shared.clearSessionIfMatching(
-                        token: requestToken,
-                        ignoreIfRefreshing: true,
-                        for: sessionKey,
-                        using: keychain
-                    )
-                }
+            if case MacrofyError.unauthorized = error, let requestToken {
+                SessionRegistry.shared.endRefreshAndClearIfUnauthorized(
+                    rejectedToken: requestToken,
+                    for: sessionKey,
+                    using: keychain
+                )
+                refreshHandled = true
+            }
+            if !refreshHandled {
+                SessionRegistry.shared.endRefresh(for: sessionKey)
             }
             throw error
         }

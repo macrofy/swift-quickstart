@@ -9,6 +9,49 @@ import SwiftUI
 import Combine
 import UIKit
 
+/// Manages the demo user identity atomically across concurrent view model initializations,
+/// distinguishing genuine first-launch missing items from transient Keychain access failures.
+private final class DemoIdentityManager: @unchecked Sendable {
+    static let shared = DemoIdentityManager()
+    private let lock = NSLock()
+    private var cachedId: String?
+    private let key = "macrofy_demo_external_user_id"
+
+    func loadOrCreateDemoUserId(using keychain: KeychainStore) -> (id: String, persisted: Bool) {
+        lock.lock()
+        defer { lock.unlock() }
+
+        if let cached = cachedId {
+            return (cached, true)
+        }
+
+        switch keychain.readResult(key: key) {
+        case .success(let data):
+            if let existing = String(data: data, encoding: .utf8), !existing.isEmpty {
+                cachedId = existing
+                return (existing, true)
+            }
+        case .failure:
+            // Keychain read encountered a transient error (e.g. device locked).
+            // Do NOT generate a replacement ID or overwrite the existing key!
+            let fallbackId = "user_ios_\(UUID().uuidString.prefix(12))"
+            return (fallbackId, false)
+        case .notFound:
+            break
+        }
+
+        let newId = "user_ios_\(UUID().uuidString.prefix(12))"
+        guard let data = newId.data(using: .utf8) else {
+            return (newId, false)
+        }
+        if keychain.save(key: key, data: data) {
+            cachedId = newId
+            return (newId, true)
+        }
+        return (newId, false)
+    }
+}
+
 @MainActor
 final class MacrofyAppViewModel: ObservableObject {
     private let client = MacrofyClient()
@@ -337,22 +380,7 @@ final class MacrofyAppViewModel: ObservableObject {
     }
 
     private static func loadOrCreateDemoUserId() -> (id: String, persisted: Bool) {
-        let key = "macrofy_demo_external_user_id"
-        if let data = KeychainStore.shared.read(key: key),
-           let existing = String(data: data, encoding: .utf8),
-           !existing.isEmpty {
-            return (existing, true)
-        }
-
-        let newId = "user_ios_\(UUID().uuidString.prefix(12))"
-        guard let data = newId.data(using: .utf8) else {
-            return (newId, false)
-        }
-        // Save to Keychain, retrying once if transiently locked
-        if KeychainStore.shared.save(key: key, data: data) || KeychainStore.shared.save(key: key, data: data) {
-            return (newId, true)
-        }
-        return (newId, false)
+        DemoIdentityManager.shared.loadOrCreateDemoUserId(using: KeychainStore.shared)
     }
 }
 
