@@ -22,22 +22,32 @@ flowchart TD
 The codebase is configured for modern Swift concurrency (`Swift 5.9+ / Swift 6`):
 - **Actor Isolation**: Network requests, tokens, and active sessions are managed inside the `MacrofyClient` actor to prevent data races.
 - **MainActor Separation**: The presentation layer (`MacrofyAppViewModel`, `ContentView`) is isolated to `@MainActor`.
-- **Nonisolated Domain Models**: All models (`Models.swift`), configuration (`Configuration.swift`), errors (`MacrofyError.swift`), and utilities (`SignatureUtility.swift`, `KeychainStore.swift`) conform to `Sendable` and are marked `nonisolated` to allow seamless passing across actor boundaries without concurrency warnings.
+- **Nonisolated Domain Models**: All models (`Models.swift`), configuration (`Configuration.swift`), errors (`MacrofyError.swift`), and utilities (`KeychainStore.swift`) conform to `Sendable` and are marked `nonisolated` to allow seamless passing across actor boundaries without concurrency warnings.
 
 ---
 
 ## 2. Project File Structure
 
-| File | Role & Implementation Details |
-| :--- | :--- |
-| `Configuration.swift` | Holds `AppConfig` defining the production base URL (`https://api.macrofy.com`) and the tenant `appId`. |
-| `SignatureUtility.swift` | Computes 64-character lowercase hexadecimal HMAC-SHA256 signatures using `CryptoKit` for the client authentication handshake. |
-| `KeychainStore.swift` | Thread-safe Keychain wrapper using `Security.framework` (`kSecClassGenericPassword`) to securely persist and retrieve session tokens and user data across app launches. |
-| `Models.swift` | Complete `Codable`, `Sendable` schemas matching the Macrofy API: Auth, Foods, Barcodes, AI Image Scanning, Profiles & Mifflin-St Jeor Goals, Food Diary, and Daily Totals. |
-| `MacrofyError.swift` | Strongly typed `MacrofyError` conforming to `LocalizedError`, mapping HTTP status codes (400, 401, 403, 404, 429, 500), JSON decoding errors, direct uploads, and SSE timeouts. |
-| `MacrofyClient.swift` | Reusable actor-based API client implementing all Macrofy API endpoints, session management, direct cloud storage uploads, and SSE streaming. |
-| `ContentView.swift` | SwiftUI view and `@MainActor MacrofyAppViewModel` demonstrating authentication, diary log rendering, daily totals, and AI scan simulation. |
-| `Nutrition_AI_QuickStartApp.swift` | Standard SwiftUI App entry point launching `ContentView`. |
+```
+Nutrition AI QuickStart/
+├── App/
+│   ├── Nutrition_AI_QuickStartApp.swift   # SwiftUI App lifecycle entry point
+│   └── Configuration.swift                # AppConfig (baseURL, appId)
+├── Models/
+│   └── Models.swift                       # Codable & Sendable data schemas
+├── Services/
+│   ├── MacrofyClient.swift                # Actor-based API client & network engine
+│   ├── MacrofyError.swift                 # Error types & LocalizedError conformance
+│   └── KeychainStore.swift                # Thread-safe Keychain persistence wrapper
+├── Views/
+│   └── ContentView.swift                  # SwiftUI demo view & MacrofyAppViewModel
+└── Resources/
+    ├── Assets.xcassets                    # App icons & accent colors
+    └── sample_meal.png                    # Bundled demo meal image for AI scanning
+
+scripts/
+└── generate_signature.swift               # Standalone CLI HMAC signature generator
+```
 
 ---
 
@@ -52,7 +62,7 @@ public nonisolated struct AppConfig {
 }
 ```
 
-### 2. Authentication Handshake (`SignatureUtility.swift` & `ContentView.swift`)
+### 2. Authentication Handshake (`ContentView.swift`)
 Macrofy authenticates mobile clients using a cryptographic signature:
 ```swift
 // In production, this call is made by your backend (see Step 5 below).
@@ -66,7 +76,7 @@ let response = try await client.connect(
 ```
 Upon a successful connect call, `MacrofyClient` automatically stores the 30-day Bearer JWT and user profile in the iOS Keychain (scoped to this `appId` and host) and injects `Authorization: Bearer <token>` into all subsequent authenticated requests.
 
-> **Security note**: To prevent accidental credential leaks, **no secrets are embedded in the iOS app**. For local testing, keep your `MACROFY_APP_SECRET` in your terminal environment and run `./scripts/generate_signature.swift <userId>` to generate a disposable signature, then paste it into the app's connect screen. `SignatureUtility.generateHMAC` uses `appSecret` exactly as issued by the Developer Portal — its literal UTF-8 bytes are the HMAC key, even though the secret is formatted as a hex-looking string; do not hex-decode it first, or every signature will be rejected. Because `HMAC_SHA256(appSecret, userId)` is deterministic, treat any generated signature as sensitive and short-lived: generate it immediately before calling `connect`, never log it, and prefer proxying this exchange through your backend (Step 5 below) so the secret and signature never reach the client at all.
+> **Security note**: To prevent accidental credential leaks, **no secrets are embedded in the iOS app**. For local testing, keep your `MACROFY_APP_SECRET` in your terminal environment and run `./scripts/generate_signature.swift <userId>` to generate a disposable signature, then paste it into the app's connect screen. The HMAC-SHA256 computation uses `appSecret` exactly as issued by the Developer Portal — its literal UTF-8 bytes are the HMAC key, even though the secret is formatted as a hex-looking string; do not hex-decode it first, or every signature will be rejected. Because `HMAC_SHA256(appSecret, userId)` is deterministic, treat any generated signature as sensitive and short-lived: generate it immediately before calling `connect`, never log it, and prefer proxying this exchange through your backend (Step 5 below) so the secret and signature never reach the client at all.
 
 ### 3. Food Diary & Daily Progress
 `MacrofyAppViewModel.loadDailyData()` fetches diary entries and daily aggregate totals in parallel:

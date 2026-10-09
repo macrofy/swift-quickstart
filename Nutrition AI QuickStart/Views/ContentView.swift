@@ -252,10 +252,8 @@ final class MacrofyAppViewModel: ObservableObject {
         guard let data = newId.data(using: .utf8) else {
             return (newId, false)
         }
-        if KeychainStore.shared.save(key: key, data: data) {
-            return (newId, true)
-        }
-        if KeychainStore.shared.save(key: key, data: data) {
+        // Save to Keychain, retrying once if transiently locked
+        if KeychainStore.shared.save(key: key, data: data) || KeychainStore.shared.save(key: key, data: data) {
             return (newId, true)
         }
         return (newId, false)
