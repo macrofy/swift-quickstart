@@ -277,3 +277,4 @@ func refreshTokenIfNeeded() async {
 3. **Date Formatting**: Diary endpoints expect strict `YYYY-MM-DD` string format (e.g., `2026-10-08`). Do not send full ISO-8601 timestamps with times.
 4. **Barcode Validation**: Barcode lookups require 7 to 14 numeric characters. Always strip spaces, hyphens, and letters prior to making requests.
 5. **Cloud Storage Upload Content-Type**: The `Content-Type` specified when creating a scan job (e.g., `image/jpeg`) must match the `Content-Type` header passed in the direct binary `PUT` upload.
+6. **Clearing Nullable Fields**: In `UserProfileInput` and `DiaryEntryUpdate`, update fields use `NullableUpdate<T>`. Leaving a field `.unchanged` omits it from the JSON payload (leaving the server's existing value intact), whereas setting it to `.clear` encodes an explicit JSON `null` to clear the stored value. Setting `.set(value)` updates it to the new value.

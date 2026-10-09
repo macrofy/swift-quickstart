@@ -114,15 +114,15 @@ final class MacrofyAppViewModel: ObservableObject {
         // the view model after logout.
         latestDailyDataRequestID = UUID()
 
-        let success = await client.clearSession()
-        self.isAuthenticated = false
-        self.currentUser = nil
-        self.diaryEntries = []
-        self.dailyTotals = nil
-        if !success {
-            self.errorMessage = "Failed to completely remove stored session from Keychain."
-        } else {
+        do {
+            try await client.clearSession()
+            self.isAuthenticated = false
+            self.currentUser = nil
+            self.diaryEntries = []
+            self.dailyTotals = nil
             self.errorMessage = nil
+        } catch {
+            self.errorMessage = error.localizedDescription
         }
     }
 
