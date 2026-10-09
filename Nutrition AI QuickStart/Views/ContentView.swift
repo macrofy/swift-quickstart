@@ -41,6 +41,11 @@ final class MacrofyAppViewModel: ObservableObject {
     /// 401 error from overwriting a newer published authenticated state.
     private var authRequestGeneration: UInt64 = 0
 
+    /// Tracks the in-flight AI meal scan Task so that disconnecting or logging
+    /// out cancels any active upload or stream immediately rather than leaving
+    /// an orphaned task running or blocking future scans.
+    private var activeScanTask: Task<Void, Never>?
+
     init() {
         let (id, persisted) = Self.loadOrCreateDemoUserId()
         self.developerUserId = id
@@ -120,6 +125,10 @@ final class MacrofyAppViewModel: ObservableObject {
     }
 
     func clearAuthentication() async {
+        // Cancel any active scan immediately and reset its UI state so the
+        // scan doesn't continue uploading after logout or block re-scanning.
+        cancelActiveScan()
+
         authRequestGeneration &+= 1
         // Invalidate any in-flight daily data refresh so it cannot repopulate
         // the view model after logout.
@@ -165,9 +174,24 @@ final class MacrofyAppViewModel: ObservableObject {
         }
     }
 
+    func cancelActiveScan() {
+        activeScanTask?.cancel()
+        activeScanTask = nil
+        self.isScanning = false
+        self.scanStatusText = ""
+    }
+
+    func startScan(jpegData: Data) {
+        guard !isScanning, isAuthenticated else { return }
+        activeScanTask = Task {
+            await analyzeAndLogMeal(jpegData: jpegData)
+            activeScanTask = nil
+        }
+    }
+
     /// Complete AI Vision pipeline: Job creation -> Cloud Storage PUT -> SSE Stream -> Auto-log
     func analyzeAndLogMeal(jpegData: Data) async {
-        guard let user = currentUser else { return }
+        guard let user = currentUser, isAuthenticated else { return }
         guard !isScanning else { return }
 
         self.isScanning = true
@@ -175,17 +199,31 @@ final class MacrofyAppViewModel: ObservableObject {
         self.scanStatusText = "Initializing scan job..."
 
         do {
+            try Task.checkCancellation()
+            guard isAuthenticated else { return }
+
             // 1. Create Job & obtain pre-signed upload URL
             let job = try await client.createScanJob(contentType: "image/jpeg", imageType: "photo")
+
+            try Task.checkCancellation()
+            guard isAuthenticated else { return }
+
             self.scanStatusText = "Uploading photo to Cloud Storage..."
 
             // 2. Direct binary upload to Cloud Storage
             try await client.uploadImageBinary(uploadUrl: job.uploadUrl, imageData: jpegData)
+
+            try Task.checkCancellation()
+            guard isAuthenticated else { return }
+
             self.scanStatusText = "AI Vision analyzing meal..."
 
             // 3. Listen to SSE Pub/Sub until a terminal status arrives.
             var loggedEntry = false
             for try await update in await client.streamScanJobUpdates(jobId: job.jobId) {
+                try Task.checkCancellation()
+                guard isAuthenticated else { return }
+
                 if update.status == "failed" {
                     throw MacrofyError.scanFailed(update.errorMessage ?? "AI vision was unable to analyze this photo.")
                 }
@@ -212,6 +250,9 @@ final class MacrofyAppViewModel: ObservableObject {
                 }
             }
 
+            try Task.checkCancellation()
+            guard isAuthenticated else { return }
+
             guard loggedEntry else {
                 throw MacrofyError.sseTimeout
             }
@@ -219,7 +260,11 @@ final class MacrofyAppViewModel: ObservableObject {
             self.scanStatusText = "Completed!"
             self.errorMessage = nil
             await loadDailyData()
+        } catch is CancellationError {
+            // Task was cancelled (e.g. user disconnected during scan)
+            self.scanStatusText = ""
         } catch {
+            guard !Task.isCancelled, isAuthenticated else { return }
             await handleError(error)
             self.scanStatusText = ""
         }
@@ -395,13 +440,11 @@ struct ContentView: View {
                                 }
                             } else {
                                 Button("Simulate Camera Scan (Sample Meal Photo)") {
-                                    Task {
-                                        guard let jpegData = Self.loadSampleMealJPEGData() else {
-                                            viewModel.errorMessage = "Could not load sample_meal.png from the app bundle."
-                                            return
-                                        }
-                                        await viewModel.analyzeAndLogMeal(jpegData: jpegData)
+                                    guard let jpegData = Self.loadSampleMealJPEGData() else {
+                                        viewModel.errorMessage = "Could not load sample_meal.png from the app bundle."
+                                        return
                                     }
+                                    viewModel.startScan(jpegData: jpegData)
                                 }
                             }
                         }
