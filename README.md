@@ -76,7 +76,7 @@ let response = try await client.connect(
 ```
 Upon a successful connect call, `MacrofyClient` automatically stores the 30-day Bearer JWT and user profile in the iOS Keychain (scoped to this `appId` and host) and injects `Authorization: Bearer <token>` into all subsequent authenticated requests.
 
-> **Security note**: To prevent accidental credential leaks, **no secrets are embedded in the iOS app**. For local testing, keep your `MACROFY_APP_SECRET` in your terminal environment and run `./scripts/generate_signature.swift <userId>` to generate a disposable signature, then paste it into the app's connect screen. The HMAC-SHA256 computation uses `appSecret` exactly as issued by the Developer Portal — its literal UTF-8 bytes are the HMAC key, even though the secret is formatted as a hex-looking string; do not hex-decode it first, or every signature will be rejected. Because `HMAC_SHA256(appSecret, userId)` is deterministic, treat any generated signature as sensitive and short-lived: generate it immediately before calling `connect`, never log it, and prefer proxying this exchange through your backend (Step 5 below) so the secret and signature never reach the client at all.
+> **Security note**: To prevent accidental credential leaks, **no secrets are embedded in the iOS app**. For local testing, run `./scripts/generate_signature.swift <userId>` in your terminal and enter your secret at the secure prompt (terminal input is hidden so it is never recorded in shell history), then paste the resulting signature into the app's connect screen. The HMAC-SHA256 computation uses `appSecret` exactly as issued by the Developer Portal — its literal UTF-8 bytes are the HMAC key, even though the secret is formatted as a hex-looking string; do not hex-decode it first, or every signature will be rejected. Because `HMAC_SHA256(appSecret, userId)` is deterministic, treat any generated signature as sensitive and short-lived: generate it immediately before calling `connect`, never log it, and prefer proxying this exchange through your backend (Step 5 below) so the secret and signature never reach the client at all.
 
 ### 3. Food Diary & Daily Progress
 `MacrofyAppViewModel.loadDailyData()` fetches diary entries and daily aggregate totals in parallel:
@@ -108,11 +108,11 @@ The application demonstrates the full meal analysis lifecycle via `analyzeAndLog
 2. In `Configuration.swift`, ensure `appId` matches your registered Application ID from the Macrofy Developer Portal.
 3. Select an iOS Simulator (e.g., iPhone 16 Pro) and press **Cmd + R** to run.
 4. On the simulator's connect screen, tap the copy button next to the **External User ID** field.
-5. In your terminal, run the standalone signature generator using your portal secret (this runs outside the build so your secret is never compiled into the app):
+5. In your terminal, run the standalone signature generator with the copied User ID:
    ```bash
-   export MACROFY_APP_SECRET="<your-64-char-secret>"
    ./scripts/generate_signature.swift <pasted-user-id>
    ```
+   When prompted, enter your Macrofy App Secret. The prompt hides your input so the secret is never saved in shell command history or process inspection tables. (You can also set `MACROFY_APP_SECRET` in your environment if you prefer.)
 6. Paste the printed signature into the **HMAC Signature** field in the simulator and tap **Connect User**.
 7. Once connected, view the Daily Totals and Logged Meals sections, or tap **Simulate Camera Scan (Sample Meal Photo)** to observe the real-time AI scan state machine.
 

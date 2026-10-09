@@ -147,12 +147,15 @@ final class MacrofyAppViewModel: ObservableObject {
         // the view model after logout.
         latestDailyDataRequestID = UUID()
 
+        // Always update the UI to the logged-out state, because in-memory
+        // credentials have been cleared and the client has no usable token.
+        self.isAuthenticated = false
+        self.currentUser = nil
+        self.diaryEntries = []
+        self.dailyTotals = nil
+
         do {
             try await client.clearSession()
-            self.isAuthenticated = false
-            self.currentUser = nil
-            self.diaryEntries = []
-            self.dailyTotals = nil
             self.errorMessage = nil
         } catch {
             self.errorMessage = error.localizedDescription
