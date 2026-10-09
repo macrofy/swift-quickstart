@@ -1,22 +1,129 @@
 import Foundation
 
-/// An in-process, thread-safe session registry that synchronizes active in-memory
-/// credentials across all `MacrofyClient` instances sharing the same tenant/host scope.
+/// An in-process, thread-safe session registry that coordinates Keychain storage,
+/// in-memory caching, authentication generation counters, and in-flight refresh
+/// tracking across all `MacrofyClient` instances sharing the same tenant/host scope.
 private nonisolated final class SessionRegistry: @unchecked Sendable {
     static let shared = SessionRegistry()
     private let lock = NSLock()
-    private var sessions: [String: (token: String?, user: SessionUser?)] = [:]
 
-    func getSession(for key: String) -> (token: String?, user: SessionUser?)? {
-        lock.lock()
-        defer { lock.unlock() }
-        return sessions[key]
+    private var sessions: [String: (token: String?, user: SessionUser?)] = [:]
+    private var authGenerations: [String: UInt64] = [:]
+    private var installedAuthGenerations: [String: UInt64] = [:]
+    private var inFlightRefreshCounts: [String: Int] = [:]
+
+    struct PersistedSession: Codable {
+        let token: String
+        let user: SessionUser
     }
 
-    func setSession(token: String?, user: SessionUser?, for key: String) {
+    /// Ensures the session for `key` is loaded from Keychain and validated against `expectedAppId`.
+    func restoreIfNeeded(for key: String, expectedAppId: String, using keychain: KeychainStore) {
         lock.lock()
         defer { lock.unlock() }
+
+        guard sessions[key] == nil else { return }
+
+        if let data = keychain.read(key: key),
+           let record = try? JSONDecoder().decode(PersistedSession.self, from: data),
+           record.user.appId == expectedAppId {
+            sessions[key] = (record.token, record.user)
+        } else {
+            keychain.delete(key: key)
+            sessions[key] = (nil, nil)
+        }
+    }
+
+    /// Atomically reads the current (token, user) snapshot for `key`.
+    func getSessionSnapshot(for key: String) -> (token: String?, user: SessionUser?) {
+        lock.lock()
+        defer { lock.unlock() }
+        let session = sessions[key]
+        return (session?.token, session?.user)
+    }
+
+    /// Allocates the next authentication generation counter for `key`.
+    func nextAuthGeneration(for key: String) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        let next = (authGenerations[key] ?? 0) &+ 1
+        authGenerations[key] = next
+        return next
+    }
+
+    /// Returns the currently installed generation for `key`.
+    func installedAuthGeneration(for key: String) -> UInt64 {
+        lock.lock()
+        defer { lock.unlock() }
+        return installedAuthGenerations[key] ?? 0
+    }
+
+    /// Persists a session atomically to both Keychain and the in-memory registry.
+    /// Advances `installedAuthGenerations` ONLY after Keychain persistence succeeds.
+    func saveSession(
+        token: String,
+        user: SessionUser,
+        generation: UInt64?,
+        for key: String,
+        using keychain: KeychainStore
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let record = PersistedSession(token: token, user: user)
+        guard let data = try? JSONEncoder().encode(record),
+              keychain.save(key: key, data: data) else {
+            return false
+        }
+
         sessions[key] = (token, user)
+        let currentInstalled = installedAuthGenerations[key] ?? 0
+        let targetGen = generation ?? ((authGenerations[key] ?? 0) &+ 1)
+        installedAuthGenerations[key] = max(currentInstalled, targetGen)
+        return true
+    }
+
+    /// Clears the session from both Keychain and the in-memory registry.
+    /// Throws if Keychain removal and fallback overwrite both fail, preventing
+    /// logout from completing while leaving restorable credentials in storage.
+    func clearSession(for key: String, using keychain: KeychainStore) throws {
+        lock.lock()
+        defer { lock.unlock() }
+
+        let deleted = keychain.delete(key: key)
+        let fallbackOverwritten = !deleted ? keychain.save(key: key, data: Data()) : false
+
+        guard deleted || fallbackOverwritten else {
+            throw MacrofyError.serverError(
+                statusCode: 0,
+                message: "Failed to remove stored session from Keychain."
+            )
+        }
+
+        sessions[key] = (nil, nil)
+        installedAuthGenerations[key] = (authGenerations[key] ?? 0) &+ 1
+    }
+
+    /// Increments the in-flight refresh counter for `key`.
+    func beginRefresh(for key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        inFlightRefreshCounts[key, default: 0] += 1
+    }
+
+    /// Decrements the in-flight refresh counter for `key`.
+    func endRefresh(for key: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        let current = inFlightRefreshCounts[key, default: 1]
+        inFlightRefreshCounts[key] = max(0, current - 1)
+    }
+
+    /// Returns whether any refresh is currently in flight for `key`.
+    func isRefreshing(for key: String) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return (inFlightRefreshCounts[key] ?? 0) > 0
     }
 }
 
@@ -32,35 +139,11 @@ public actor MacrofyClient {
     private let sessionKey: String
 
     public var currentToken: String? {
-        SessionRegistry.shared.getSession(for: sessionKey)?.token
+        sessionSnapshot().token
     }
 
     public var currentUser: SessionUser? {
-        SessionRegistry.shared.getSession(for: sessionKey)?.user
-    }
-
-    /// Incremented whenever an auth operation starts OR when the session is
-    /// explicitly modified/cleared, so pending operations can detect that
-    /// their results have been superseded.
-    private var authGeneration: UInt64 = 0
-
-    /// The generation of the authentication call that most recently installed
-    /// a session via `setSession`. Only advances when a session is actually
-    /// installed or explicitly cleared/set, so older in-flight requests cannot
-    /// overwrite newer ones or resurrect credentials after logout.
-    private var installedAuthGeneration: UInt64 = 0
-
-    /// Tracks whether a token refresh is currently in flight so that a 401
-    /// received on a concurrent request using the expiring token does not
-    /// prematurely invalidate the refresh and log the user out.
-    private var isRefreshing: Bool = false
-
-    /// Atomic on-disk representation storing token and user together in a
-    /// single Keychain item, preventing concurrent writes from interleaving
-    /// a token with the wrong user.
-    private struct PersistedSession: Codable {
-        let token: String
-        let user: SessionUser
+        sessionSnapshot().user
     }
 
     public init(
@@ -75,19 +158,7 @@ public actor MacrofyClient {
         let host = baseURL.host ?? "default"
         self.sessionKey = "macrofy_session_\(appId)_\(host)"
 
-        // Synchronize in-memory credentials across all client instances sharing
-        // this sessionKey. If this scope hasn't been loaded in-process yet,
-        // restore it atomically from Keychain and verify the appId matches.
-        if SessionRegistry.shared.getSession(for: sessionKey) == nil {
-            if let data = keychain.read(key: sessionKey),
-               let record = try? JSONDecoder().decode(PersistedSession.self, from: data),
-               record.user.appId == appId {
-                SessionRegistry.shared.setSession(token: record.token, user: record.user, for: sessionKey)
-            } else {
-                keychain.delete(key: sessionKey)
-                SessionRegistry.shared.setSession(token: nil, user: nil, for: sessionKey)
-            }
-        }
+        SessionRegistry.shared.restoreIfNeeded(for: sessionKey, expectedAppId: appId, using: keychain)
     }
 
     // MARK: - Session Management
@@ -99,56 +170,33 @@ public actor MacrofyClient {
         guard user.appId == self.appId else {
             return false
         }
-
-        authGeneration &+= 1
-        installedAuthGeneration = authGeneration
-
-        let previousToken = self.currentToken
-        let previousUser = self.currentUser
-
-        let record = PersistedSession(token: token, user: user)
-        guard let data = try? JSONEncoder().encode(record),
-              keychain.save(key: sessionKey, data: data) else {
-            // Restore previous state if persistence fails
-            SessionRegistry.shared.setSession(token: previousToken, user: previousUser, for: sessionKey)
-            return false
-        }
-
-        SessionRegistry.shared.setSession(token: token, user: user, for: sessionKey)
-        return true
+        return SessionRegistry.shared.saveSession(
+            token: token,
+            user: user,
+            generation: nil,
+            for: sessionKey,
+            using: keychain
+        )
     }
 
     /// Clears the session from memory and Keychain across all clients sharing this scope.
-    ///
-    /// Throws an error if Keychain deletion fails and cannot be invalidated, so that
-    /// logout cannot complete while leaving restorable credentials in storage.
+    /// Throws if Keychain deletion fails and cannot be invalidated.
     @discardableResult
     public func clearSession() throws -> Bool {
-        authGeneration &+= 1
-        installedAuthGeneration = authGeneration
-
-        let deleted = keychain.delete(key: sessionKey)
-        let fallbackOverwritten = !deleted ? keychain.save(key: sessionKey, data: Data()) : false
-
-        guard deleted || fallbackOverwritten else {
-            throw MacrofyError.serverError(
-                statusCode: 0,
-                message: "Failed to remove stored session from Keychain."
-            )
-        }
-
-        SessionRegistry.shared.setSession(token: nil, user: nil, for: sessionKey)
+        try SessionRegistry.shared.clearSession(for: sessionKey, using: keychain)
         return true
     }
 
     public var isAuthenticated: Bool {
-        currentToken != nil && currentUser != nil
+        sessionSnapshot().isAuthenticated
     }
 
     /// Atomically reads whether the client is authenticated together with
-    /// the current user, in a single actor hop.
-    public func sessionSnapshot() -> (isAuthenticated: Bool, user: SessionUser?) {
-        (isAuthenticated, currentUser)
+    /// the current token and user, in a single synchronized registry lookup.
+    public func sessionSnapshot() -> (isAuthenticated: Bool, token: String?, user: SessionUser?) {
+        let (token, user) = SessionRegistry.shared.getSessionSnapshot(for: sessionKey)
+        let authed = (token != nil && user != nil)
+        return (authed, authed ? token : nil, authed ? user : nil)
     }
 
     // MARK: - Generic Request Pipeline
@@ -218,7 +266,7 @@ public actor MacrofyClient {
             // Only clear the session if it still holds the exact token that was rejected,
             // AND we are not currently in the middle of refreshing that expiring token.
             if let requestToken, requestToken == currentToken {
-                if !isRefreshing {
+                if !SessionRegistry.shared.isRefreshing(for: sessionKey) {
                     _ = try? clearSession()
                 }
             }
@@ -259,8 +307,7 @@ public actor MacrofyClient {
             throw MacrofyError.badRequest(message: "App ID '\(appId)' does not match client's configured App ID '\(self.appId)'.")
         }
 
-        authGeneration &+= 1
-        let generation = authGeneration
+        let generation = SessionRegistry.shared.nextAuthGeneration(for: sessionKey)
 
         let req = ConnectRequest(appId: appId, userId: userId, signature: signature)
         let body = try JSONEncoder().encode(req)
@@ -277,10 +324,13 @@ public actor MacrofyClient {
 
     /// Refreshes the active Bearer JWT token before expiration.
     public func refreshSession() async throws -> AuthResponse {
-        authGeneration &+= 1
-        let generation = authGeneration
-        isRefreshing = true
-        defer { isRefreshing = false }
+        let requestToken = currentToken
+        let generation = SessionRegistry.shared.nextAuthGeneration(for: sessionKey)
+
+        SessionRegistry.shared.beginRefresh(for: sessionKey)
+        defer {
+            SessionRegistry.shared.endRefresh(for: sessionKey)
+        }
 
         do {
             let response: AuthResponse = try await execute(
@@ -291,8 +341,11 @@ public actor MacrofyClient {
             )
             return try applyAuthResponse(response, generation: generation)
         } catch {
+            // Clear session ONLY if the rejected token is still the current token
             if case MacrofyError.unauthorized = error {
-                _ = try? clearSession()
+                if let requestToken, requestToken == currentToken {
+                    _ = try? clearSession()
+                }
             }
             throw error
         }
@@ -303,11 +356,17 @@ public actor MacrofyClient {
     private func applyAuthResponse(_ response: AuthResponse, generation: UInt64) throws -> AuthResponse {
         // Supersede an earlier response only when a newer authentication operation
         // has actually installed or changed the session (installedAuthGeneration > generation).
-        guard generation >= installedAuthGeneration else {
+        guard generation >= SessionRegistry.shared.installedAuthGeneration(for: sessionKey) else {
             throw MacrofyError.sessionSuperseded
         }
 
-        guard setSession(token: response.token, user: response.user) else {
+        guard SessionRegistry.shared.saveSession(
+            token: response.token,
+            user: response.user,
+            generation: generation,
+            for: sessionKey,
+            using: keychain
+        ) else {
             throw MacrofyError.serverError(
                 statusCode: 0,
                 message: "Authenticated successfully, but failed to persist the session securely. Please try again."
@@ -377,6 +436,7 @@ public actor MacrofyClient {
         let streamURL = baseURL.appendingPathComponent("v1/scan/image/\(jobId)/stream")
         let token = self.currentToken
         let session = self.session
+        let sessionKey = self.sessionKey
 
         return AsyncThrowingStream { continuation in
             let producerTask = Task {
@@ -393,7 +453,7 @@ public actor MacrofyClient {
                         let code = (response as? HTTPURLResponse)?.statusCode ?? 500
                         if code == 401 {
                             if let token, self.currentToken == token {
-                                if !self.isRefreshing {
+                                if !SessionRegistry.shared.isRefreshing(for: sessionKey) {
                                     _ = try? self.clearSession()
                                 }
                             }

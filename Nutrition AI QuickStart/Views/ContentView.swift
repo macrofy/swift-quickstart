@@ -93,17 +93,28 @@ final class MacrofyAppViewModel: ObservableObject {
         }
 
         authRequestGeneration &+= 1
+        let generation = authRequestGeneration
 
         do {
-            let response = try await client.connect(
+            _ = try await client.connect(
                 appId: AppConfig.appId,
                 userId: cleanUserId,
                 signature: cleanSignature
             )
+
+            // Guard against an out-of-order completion: if a newer authentication
+            // attempt was initiated while this one was in flight, discard this result.
+            guard generation == authRequestGeneration else { return }
+
+            // Publish the client's current atomic session snapshot rather than an obsolete response.
+            let snapshot = await client.sessionSnapshot()
+            guard generation == authRequestGeneration, snapshot.isAuthenticated else { return }
+
             self.isAuthenticated = true
-            self.currentUser = response.user
+            self.currentUser = snapshot.user
             await loadDailyData()
         } catch {
+            guard generation == authRequestGeneration else { return }
             await handleError(error)
         }
     }
