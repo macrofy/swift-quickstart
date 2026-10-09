@@ -105,14 +105,22 @@ public actor MacrofyClient {
     /// Clears the session from memory and Keychain.
     ///
     /// Advances `authGeneration` so any in-flight `connect()` or
-    /// `refreshSession()` cannot resurrect credentials after logout.
-    public func clearSession() {
+    /// `refreshSession()` cannot resurrect credentials after logout. Returns
+    /// `false` if the Keychain item could not be removed (in which case it
+    /// overwrites the key with empty data so the session cannot be restored).
+    @discardableResult
+    public func clearSession() -> Bool {
         authGeneration &+= 1
         installedAuthGeneration = authGeneration
 
+        let deleted = keychain.delete(key: sessionKey)
+        if !deleted {
+            _ = keychain.save(key: sessionKey, data: Data())
+        }
+
         self.currentToken = nil
         self.currentUser = nil
-        keychain.delete(key: sessionKey)
+        return deleted
     }
 
     public var isAuthenticated: Bool {
@@ -228,6 +236,10 @@ public actor MacrofyClient {
 
     /// Exchanges HMAC-SHA256 signature for a Bearer JWT session token.
     public func connect(appId: String, userId: String, signature: String) async throws -> AuthResponse {
+        guard appId == self.appId else {
+            throw MacrofyError.badRequest(message: "App ID '\(appId)' does not match client's configured App ID '\(self.appId)'.")
+        }
+
         authGeneration &+= 1
         let generation = authGeneration
 

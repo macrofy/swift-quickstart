@@ -20,6 +20,7 @@ final class MacrofyAppViewModel: ObservableObject {
     @Published var scanStatusText: String = ""
     @Published var isScanning = false
     @Published var errorMessage: String?
+    @Published var persistenceWarning: String?
 
     // MARK: - Credentials & Signature Input
     //
@@ -44,7 +45,7 @@ final class MacrofyAppViewModel: ObservableObject {
         let (id, persisted) = Self.loadOrCreateDemoUserId()
         self.developerUserId = id
         if !persisted {
-            self.errorMessage = "Could not save a stable demo user ID to the Keychain. Your demo diary may not persist across launches."
+            self.persistenceWarning = "Could not save demo user ID to the Keychain. Your demo diary may not persist across launches."
         }
         Task {
             await checkAuthentication()
@@ -75,6 +76,12 @@ final class MacrofyAppViewModel: ObservableObject {
         let cleanUserId = developerUserId.trimmingCharacters(in: .whitespacesAndNewlines)
         let cleanSignature = signatureInput.trimmingCharacters(in: .whitespacesAndNewlines)
 
+        // Clear signature input from memory immediately after reading it,
+        // whether the connection attempt succeeds or fails.
+        defer {
+            self.signatureInput = ""
+        }
+
         guard !cleanUserId.isEmpty else {
             self.errorMessage = "User ID cannot be empty."
             return
@@ -95,7 +102,6 @@ final class MacrofyAppViewModel: ObservableObject {
             )
             self.isAuthenticated = true
             self.currentUser = response.user
-            self.signatureInput = ""
             await loadDailyData()
         } catch {
             await handleError(error)
@@ -104,16 +110,24 @@ final class MacrofyAppViewModel: ObservableObject {
 
     func clearAuthentication() async {
         authRequestGeneration &+= 1
-        await client.clearSession()
+        // Invalidate any in-flight daily data refresh so it cannot repopulate
+        // the view model after logout.
+        latestDailyDataRequestID = UUID()
+
+        let success = await client.clearSession()
         self.isAuthenticated = false
         self.currentUser = nil
         self.diaryEntries = []
         self.dailyTotals = nil
-        self.errorMessage = nil
+        if !success {
+            self.errorMessage = "Failed to completely remove stored session from Keychain."
+        } else {
+            self.errorMessage = nil
+        }
     }
 
     func loadDailyData() async {
-        guard let user = currentUser else { return }
+        guard let user = currentUser, isAuthenticated else { return }
         let today = Self.diaryDateString()
 
         let requestID = UUID()
@@ -125,13 +139,17 @@ final class MacrofyAppViewModel: ObservableObject {
 
             let (entries, totals) = try await (entriesTask, totalsTask)
 
-            guard requestID == latestDailyDataRequestID else { return }
+            guard requestID == latestDailyDataRequestID,
+                  self.isAuthenticated,
+                  self.currentUser?.id == user.id else { return }
 
             self.diaryEntries = entries
             self.dailyTotals = totals
             self.errorMessage = nil
         } catch {
-            guard requestID == latestDailyDataRequestID else { return }
+            guard requestID == latestDailyDataRequestID,
+                  self.isAuthenticated,
+                  self.currentUser?.id == user.id else { return }
             await handleError(error)
         }
     }
@@ -300,7 +318,7 @@ struct ContentView: View {
                                 Text("HMAC Signature")
                                     .font(.caption).bold()
                                     .foregroundStyle(.secondary)
-                                TextField("Paste 64-char hex signature", text: $viewModel.signatureInput)
+                                SecureField("Paste 64-char hex signature", text: $viewModel.signatureInput)
                                     .textFieldStyle(.roundedBorder)
                                     .textInputAutocapitalization(.never)
                                     .autocorrectionDisabled()
@@ -383,6 +401,13 @@ struct ContentView: View {
                             }
                         }
                     }
+                }
+
+                if let warning = viewModel.persistenceWarning {
+                    Text(warning)
+                        .font(.footnote)
+                        .foregroundStyle(.orange)
+                        .padding(.horizontal)
                 }
 
                 if let error = viewModel.errorMessage {
