@@ -7,6 +7,7 @@
 
 import SwiftUI
 import Combine
+import UIKit
 
 @MainActor
 final class MacrofyAppViewModel: ObservableObject {
@@ -353,11 +354,13 @@ struct ContentView: View {
                                     Text(viewModel.scanStatusText).font(.subheadline)
                                 }
                             } else {
-                                Button("Simulate Camera Scan (Salmon Bowl)") {
-                                    // Simulated 1x1 JPEG byte data for testing
-                                    let sampleJpeg = Data([0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 0x4A, 0x46, 0x49, 0x46])
+                                Button("Simulate Camera Scan (Sample Meal Photo)") {
                                     Task {
-                                        await viewModel.analyzeAndLogMeal(jpegData: sampleJpeg)
+                                        guard let jpegData = Self.loadSampleMealJPEGData() else {
+                                            viewModel.errorMessage = "Could not load sample_meal.png from the app bundle."
+                                            return
+                                        }
+                                        await viewModel.analyzeAndLogMeal(jpegData: jpegData)
                                     }
                                 }
                             }
@@ -374,6 +377,20 @@ struct ContentView: View {
             }
             .navigationTitle("Macrofy")
         }
+    }
+
+    /// Loads the bundled `sample_meal.png` demo asset and re-encodes it as
+    /// JPEG, since the scan pipeline is wired up for `image/jpeg` uploads
+    /// (the `Content-Type` sent here must match the one used to create the
+    /// scan job).
+    private static func loadSampleMealJPEGData() -> Data? {
+        guard let url = Bundle.main.url(forResource: "sample_meal", withExtension: "png"),
+              let pngData = try? Data(contentsOf: url),
+              let image = UIImage(data: pngData),
+              let jpegData = image.jpegData(compressionQuality: 0.9) else {
+            return nil
+        }
+        return jpegData
     }
 }
 
